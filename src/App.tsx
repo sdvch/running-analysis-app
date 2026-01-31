@@ -11283,8 +11283,7 @@ case 6: {
               </div>
             </div>
 
-            {/* 全ユーザーに表示（ベータ版） - パーンモードでは非表示 */}
-            {analysisMode !== 'panning' && (
+            {/* 全ユーザーに表示（ベータ版） */}
             <>
                 {/* ステップメトリクス */}
                 <div className="result-card">
@@ -12492,7 +12491,6 @@ case 6: {
                 )}
               </div>
             </>
-            )}
 
             {/* ナビゲーションボタン */}
             <div style={{ marginTop: '32px', display: 'flex', gap: '12px', justifyContent: 'space-between', flexWrap: 'wrap' }}>
