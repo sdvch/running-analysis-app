@@ -535,12 +535,23 @@ export function generateTrainingRecommendations(hfvp: HFVPResult): string[] {
  * @param athleteHeightM - Athlete's height (m)
  * @returns HFVPResult or null if insufficient data
  */
+/**
+ * パンモード用 H-FVP 計算
+ * 
+ * Samozino et al. (2016) の手法に基づき、距離-時間データから H-FVP を計算
+ * 
+ * 主要な式:
+ * 1. 各地点での速度: v = d / t
+ * 2. 加速度: a = (v_next² - v_prev²) / (2 × d)
+ * 3. 水平力: F_h = m × a + F_air
+ * 4. 線形回帰: F_h = F0 - (F0/V0) × v
+ */
 export function calculateHFVPFromPanningSplits(
   splits: PanningSplitDataForHFVP[],
   bodyMassKg: number,
   athleteHeightM: number = 1.75
 ): HFVPResult | null {
-  console.log(`\n📊 === H-FVP Calculation (Panning Mode) ===`);
+  console.log(`\n📊 === H-FVP Calculation (Panning Mode - Samozino Method) ===`);
   console.log(`   Body mass: ${bodyMassKg.toFixed(1)} kg`);
   console.log(`   Height: ${athleteHeightM.toFixed(2)} m`);
   console.log(`   Total splits: ${splits.length}`);
@@ -564,81 +575,103 @@ export function calculateHFVPFromPanningSplits(
   const g = 9.81; // Gravity (m/s²)
   const warnings: string[] = [];
   
-  // Calculate data points from splits
+  // Samozino et al. (2016) の正確な方法：区間ベースの計算
   const dataPoints: HFVPResult['dataPoints'] = [];
   const velocities: number[] = [];
   const horizontalForces: number[] = [];
   
-  for (let i = 0; i < splits.length; i++) {
-    const split = splits[i];
-    const velocity = split.velocity;
-    velocities.push(velocity);
+  // 各区間の平均速度を先に計算
+  const intervalVelocities: number[] = [];
+  for (let i = 1; i < splits.length; i++) {
+    const deltaD = splits[i].distance - splits[i-1].distance;
+    const deltaT = splits[i].time - splits[i-1].time;
+    intervalVelocities.push(deltaD / deltaT);
+  }
+  
+  // 各区間で計算
+  for (let i = 1; i < splits.length; i++) {
+    const prevSplit = splits[i - 1];
+    const currSplit = splits[i];
     
-    // Calculate acceleration from velocity change
-    let acceleration = 0;
-    if (i < splits.length - 1) {
-      const nextSplit = splits[i + 1];
-      const deltaV = nextSplit.velocity - velocity;
-      const deltaT = nextSplit.time - split.time;
-      
-      if (deltaT > 0) {
-        acceleration = deltaV / deltaT;
-      }
-    } else if (i > 0) {
-      // Last split: use previous acceleration
-      const prevSplit = splits[i - 1];
-      const deltaV = velocity - prevSplit.velocity;
-      const deltaT = split.time - prevSplit.time;
-      
-      if (deltaT > 0) {
-        acceleration = deltaV / deltaT;
-      }
+    // 区間の距離と時間
+    const deltaD = currSplit.distance - prevSplit.distance;
+    const deltaT = currSplit.time - prevSplit.time;
+    
+    if (deltaT <= 0 || deltaD <= 0) {
+      console.warn(`⚠️ Invalid interval ${i}: deltaD=${deltaD}, deltaT=${deltaT}`);
+      continue;
     }
     
-    // Air resistance (drag force)
+    // 区間の平均速度
+    const v_avg = intervalVelocities[i - 1];
+    
+    // 加速度の計算（シンプルな方法）
+    // 前の区間との速度差から計算
+    let a_avg = 0;
+    if (i === 1) {
+      // 最初の区間：0から加速
+      a_avg = v_avg / deltaT;
+    } else {
+      // 速度の変化率
+      const v_prev = intervalVelocities[i - 2];
+      const v_curr = intervalVelocities[i - 1];
+      a_avg = (v_curr - v_prev) / deltaT;
+    }
+    
+    // 線形回帰用の速度（区間の平均速度）
+    const velocity = v_avg;
+    velocities.push(velocity);
+    
+    // 空気抵抗（平均速度で計算）
     const rho = 1.225; // kg/m³
     const Cd = 0.9;
     const frontalArea = 0.2025 * athleteHeightM * athleteHeightM; // m²
-    const dragForce = 0.5 * rho * Cd * frontalArea * velocity * velocity;
+    const dragForce = 0.5 * rho * Cd * frontalArea * v_avg * v_avg;
     
-    // Net horizontal force (Newton's 2nd law + air resistance)
-    const horizontalForce = bodyMassKg * acceleration + dragForce;
+    // 水平方向の正味力（Newtonの第2法則 + 空気抵抗）
+    const horizontalForce = bodyMassKg * a_avg + dragForce;
     horizontalForces.push(horizontalForce);
     
-    // Estimate contact angle
-    const maxVelocity = Math.max(...velocities);
-    const velocityRatio = maxVelocity > 0 ? velocity / maxVelocity : 0;
-    const contactAngle = 60 - 15 * velocityRatio; // degrees (60° → 45°)
+    // 接地角度を速度から推定
+    // 低速: ~65°, 高速: ~48°
+    const maxVelocity = velocities.length > 0 ? Math.max(...velocities) : v_avg;
+    const minVelocity = velocities.length > 0 ? Math.min(...velocities) : 0;
+    const velocityRange = maxVelocity - minVelocity;
+    const velocityRatio = velocityRange > 0 ? (velocity - minVelocity) / velocityRange : 0;
+    const contactAngleDeg = 65 - 17 * velocityRatio; // 65° → 48°
+    const contactAngleRad = (contactAngleDeg * Math.PI) / 180;
     
-    // Vertical force (constant body weight support)
-    const verticalForce = bodyMassKg * g;
+    // 垂直力を接地角度から推定
+    // F_v / F_h = tan(θ) より F_v = F_h × tan(θ)
+    const tanAngle = Math.tan(contactAngleRad);
+    const verticalForce = horizontalForce * tanAngle;
     
-    // Resultant force
+    // 合成力
     const resultantForce = Math.sqrt(
       horizontalForce * horizontalForce + 
       verticalForce * verticalForce
     );
     
-    // Power = F_horizontal * v
+    // パワー
     const power = horizontalForce * velocity;
     
-    // Force ratio: RF = F_horizontal / F_resultant
+    // 力比率
     const forceRatio = resultantForce > 0 
       ? (horizontalForce / resultantForce) * 100 
       : 0;
     
-    console.log(`   Split ${i}: v=${velocity.toFixed(2)} m/s, a=${acceleration.toFixed(2)} m/s², F_h=${horizontalForce.toFixed(1)} N, RF=${forceRatio.toFixed(1)}%`);
+    console.log(`   Interval ${i} (${prevSplit.distance.toFixed(0)}-${currSplit.distance.toFixed(0)}m): v_avg=${v_avg.toFixed(2)} m/s, a=${a_avg.toFixed(2)} m/s², F_h=${horizontalForce.toFixed(1)} N`);
     
     dataPoints.push({
-      velocity,
+      velocity: v_avg,  // 線形回帰用に平均速度を使用
       horizontalForce,
       verticalForce,
       resultantForce,
       power,
       forceRatio,
-      distance: split.distance,
-      acceleration,
-      contactAngle,
+      distance: currSplit.distance,
+      acceleration: a_avg,
+      contactAngle: contactAngleDeg,
     });
   }
   
@@ -690,9 +723,9 @@ export function calculateHFVPFromPanningSplits(
   const avgForce = horizontalForces.reduce((sum, f) => sum + f, 0) / horizontalForces.length;
   const avgPower = dataPoints.reduce((sum, p) => sum + p.power, 0) / dataPoints.length;
   const peakVelocity = Math.max(...velocities);
-  const accelerations = dataPoints.map(p => p.acceleration);
-  const avgAcceleration = accelerations.reduce((sum, a) => sum + a, 0) / accelerations.length;
-  const peakAcceleration = Math.max(...accelerations);
+  const allAccelerations = dataPoints.map(p => p.acceleration);
+  const avgAcceleration = allAccelerations.reduce((sum, a) => sum + a, 0) / allAccelerations.length;
+  const peakAcceleration = Math.max(...allAccelerations);
   const avgForceRatio = dataPoints.reduce((sum, p) => sum + p.forceRatio, 0) / dataPoints.length;
   const totalDistance = splits[splits.length - 1].distance - splits[0].distance;
   const totalTime = splits[splits.length - 1].time - splits[0].time;

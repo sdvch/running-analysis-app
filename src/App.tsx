@@ -791,6 +791,8 @@ useEffect(() => {
   const [panningStartIndex, setPanningStartIndex] = useState<number | null>(null);
   const [panningEndIndex, setPanningEndIndex] = useState<number | null>(null);
   const [panningZoomLevel, setPanningZoomLevel] = useState<number>(1); // ズームレベル (1=100%, 2=200%, etc.)
+  const [panningInputMode, setPanningInputMode] = useState<'video' | 'manual'>('video'); // 入力モード切り替え
+  const [manualTimeInput, setManualTimeInput] = useState<string>(''); // 手動タイム入力
   
   // ドラッグ用のstate
   const panningViewportRef = useRef<HTMLDivElement | null>(null);
@@ -2650,105 +2652,118 @@ const clearMarksByButton = () => {
   }, [analysisMode, mergedStepMetrics, contactFrames, manualContactFrames, usedTargetFps, poseResults, distanceValue, isPanMode, calibrationType, runType, savedStartHipX, savedEndHipX, sectionStartFrame, sectionEndFrame]);
 
   // ⚡ H-FVP 計算（Horizontal Force-Velocity Profile）
+  // パンモードでは10mスプリットデータからH-FVPを計算
   const hfvpResult = useMemo((): HFVPResult | null => {
-    const mode = analysisMode === 'panning' ? 'PANNING' : 'FIXED';
-    console.log(`🔍 H-FVP check [${mode}]:`, {
-      analysisMode,
-      panningSplitsLength: panningSplits.length,
-      panningStartIndex,
-      panningEndIndex,
-      athleteWeight: athleteInfo.weight_kg,
-      athleteHeight: athleteInfo.height_cm
-    });
-    
-    // 固定カメラモード: H-FVP計算を無効化
+    // 固定カメラモードでは無効
     if (analysisMode !== 'panning') {
-      console.log(`⚠️ H-FVP [FIXED]: H-FVP calculation is disabled for fixed camera mode`);
       return null;
     }
     
-    // パーン撮影モード: スプリットから測定区間を取得
+    // 測定区間が選択されていない
     if (panningStartIndex === null || panningEndIndex === null || panningStartIndex >= panningEndIndex) {
-      console.log(`⚠️ H-FVP [PANNING]: No valid measurement interval selected`, {
-        panningStartIndex,
-        panningEndIndex
-      });
       return null;
     }
     
-    const startSplit = panningSplits[panningStartIndex];
-    const endSplit = panningSplits[panningEndIndex];
     const intervalSplits = panningSplits.slice(panningStartIndex, panningEndIndex + 1);
     
-    console.log(`📊 H-FVP [PANNING]: Interval splits:`, {
-      start: startSplit,
-      end: endSplit,
-      intervalLength: intervalSplits.length,
-      allSplits: intervalSplits
-    });
-    
     if (intervalSplits.length < 3) {
-      console.log(`⚠️ H-FVP [PANNING]: Need at least 3 splits for H-FVP calculation (found ${intervalSplits.length})`);
       return null;
     }
     
-    // 選手情報から体重と身長を取得
-    const bodyMass = athleteInfo.weight_kg ?? 70; // デフォルト70kg
-    const athleteHeight = (athleteInfo.height_cm ?? 170) / 100; // cm → m、デフォルト170cm
+    // 体重と身長を取得
+    const bodyMass = athleteInfo.weight_kg ?? 70;
+    const athleteHeight = (athleteInfo.height_cm ?? 170) / 100;
     
-    // バリデーション
-    if (isNaN(bodyMass) || bodyMass <= 0 || bodyMass > 200) {
-      console.warn('⚠️ Invalid body mass for H-FVP calculation');
+    if (bodyMass <= 0 || bodyMass > 200 || athleteHeight <= 0 || athleteHeight > 2.5) {
       return null;
     }
     
-    if (isNaN(athleteHeight) || athleteHeight <= 0 || athleteHeight > 2.5) {
-      console.warn('⚠️ Invalid height for H-FVP calculation');
-      return null;
-    }
+    // スプリットデータを準備（velocityは後で計算）
+    const splitData: PanningSplitDataForHFVP[] = intervalSplits.map((split, i) => ({
+      distance: split.distance,
+      time: split.time - intervalSplits[0].time,
+      velocity: 0 // プレースホルダー、hfvpCalculatorで再計算
+    }));
     
-    // スプリットからパンモード用データを生成
-    const panningSplitData: PanningSplitDataForHFVP[] = [];
-    for (let i = 1; i < intervalSplits.length; i++) {
-      const prevSplit = intervalSplits[i - 1];
-      const currSplit = intervalSplits[i];
-      const distanceDelta = currSplit.distance - prevSplit.distance;
-      const timeDelta = currSplit.time - prevSplit.time;
-      const velocity = distanceDelta / timeDelta;
-      
-      console.log(`🔍 H-FVP [PANNING] Split ${i}:`, {
-        prevFrame: prevSplit.frame,
-        currFrame: currSplit.frame,
-        prevTime: prevSplit.time.toFixed(4),
-        currTime: currSplit.time.toFixed(4),
-        timeDelta: timeDelta.toFixed(4),
-        distanceDelta: distanceDelta.toFixed(2),
-        velocity: velocity.toFixed(4)
-      });
-      
-      panningSplitData.push({
-        distance: currSplit.distance,
-        time: currSplit.time - intervalSplits[0].time, // Relative to start
-        velocity: velocity,
-      });
-    }
+    console.log(`📊 H-FVP Input Data:`, splitData);
     
-    console.log(`🔍 H-FVP [PANNING]: Generated ${panningSplitData.length} split data points`);
-    console.log(`📊 H-FVP [PANNING]: Split data:`, panningSplitData);
-    console.log(`⚖️ H-FVP [PANNING]: Body mass: ${bodyMass}kg, Height: ${athleteHeight}m`);
-    
-    const result = calculateHFVPFromPanningSplits(panningSplitData, bodyMass, athleteHeight);
+    // H-FVP計算を実行
+    const result = calculateHFVPFromPanningSplits(splitData, bodyMass, athleteHeight);
     
     if (result) {
-      console.log(`✅ H-FVP [PANNING] calculated: ${result.quality.isValid ? 'SUCCESS' : 'FAILED'}`, result);
-      
-      // パーン撮影モードの品質情報は既に設定済み（calculateHFVPFromPanningSplitsで設定）
+      console.log(`✅ H-FVP Result:`, result);
     } else {
-      console.error(`❌ H-FVP [PANNING] calculation returned null. Check calculateHFVP function.`);
+      console.error(`❌ H-FVP calculation failed`);
     }
     
     return result;
   }, [analysisMode, panningSplits, panningStartIndex, panningEndIndex, athleteInfo.weight_kg, athleteInfo.height_cm]);
+  
+  // 🏃 パンモード用簡易スプリント分析
+  const panningSprintAnalysis = useMemo(() => {
+    if (analysisMode !== 'panning') {
+      return null;
+    }
+    
+    if (panningStartIndex === null || panningEndIndex === null || panningStartIndex >= panningEndIndex) {
+      return null;
+    }
+    
+    const intervalSplits = panningSplits.slice(panningStartIndex, panningEndIndex + 1);
+    
+    if (intervalSplits.length < 2) {
+      return null;
+    }
+    
+    // 区間データを計算
+    const intervals = [];
+    for (let i = 1; i < intervalSplits.length; i++) {
+      const prevSplit = intervalSplits[i - 1];
+      const currSplit = intervalSplits[i];
+      const distance = currSplit.distance - prevSplit.distance;
+      const time = currSplit.time - prevSplit.time;
+      const speed = distance / time;
+      const acceleration = i === 1 ? 0 : (speed - intervals[i - 2].speed) / time;
+      
+      intervals.push({
+        startDistance: prevSplit.distance,
+        endDistance: currSplit.distance,
+        distance,
+        time,
+        speed,
+        acceleration
+      });
+    }
+    
+    const totalDistance = intervalSplits[intervalSplits.length - 1].distance - intervalSplits[0].distance;
+    const totalTime = intervalSplits[intervalSplits.length - 1].time - intervalSplits[0].time;
+    const averageSpeed = totalDistance / totalTime;
+    const maxSpeed = Math.max(...intervals.map(i => i.speed));
+    const avgAcceleration = intervals.reduce((sum, i) => sum + i.acceleration, 0) / intervals.length;
+    
+    // 100m推定タイム（最大速度を維持すると仮定）
+    const estimated100mTime = totalTime + (100 - totalDistance) / maxSpeed;
+    
+    console.log(`📊 Panning Sprint Analysis:`, {
+      totalDistance,
+      totalTime,
+      averageSpeed,
+      maxSpeed,
+      avgAcceleration,
+      estimated100mTime,
+      intervals
+    });
+    
+    return {
+      intervals,
+      totalDistance,
+      totalTime,
+      averageSpeed,
+      maxSpeed,
+      avgAcceleration,
+      estimated100mTime
+    };
+  }, [analysisMode, panningSplits, panningStartIndex, panningEndIndex]);
 
   // 🎯 タイム・スピード計算
   const sectionTimeSpeed = useMemo(() => {
@@ -10111,6 +10126,51 @@ case 6: {
                     borderRadius: '12px',
                     color: 'white'
                   }}>
+                    {/* 入力モード切り替え */}
+                    <div style={{
+                      marginBottom: '16px',
+                      display: 'flex',
+                      gap: '8px',
+                      padding: '4px',
+                      background: 'rgba(0,0,0,0.2)',
+                      borderRadius: '8px'
+                    }}>
+                      <button
+                        onClick={() => setPanningInputMode('video')}
+                        style={{
+                          flex: 1,
+                          padding: '10px',
+                          fontSize: '0.9rem',
+                          fontWeight: 'bold',
+                          background: panningInputMode === 'video' ? 'rgba(255,255,255,0.9)' : 'rgba(255,255,255,0.2)',
+                          color: panningInputMode === 'video' ? '#667eea' : 'white',
+                          border: 'none',
+                          borderRadius: '6px',
+                          cursor: 'pointer',
+                          transition: 'all 0.2s'
+                        }}
+                      >
+                        🎥 動画から測定
+                      </button>
+                      <button
+                        onClick={() => setPanningInputMode('manual')}
+                        style={{
+                          flex: 1,
+                          padding: '10px',
+                          fontSize: '0.9rem',
+                          fontWeight: 'bold',
+                          background: panningInputMode === 'manual' ? 'rgba(255,255,255,0.9)' : 'rgba(255,255,255,0.2)',
+                          color: panningInputMode === 'manual' ? '#667eea' : 'white',
+                          border: 'none',
+                          borderRadius: '6px',
+                          cursor: 'pointer',
+                          transition: 'all 0.2s'
+                        }}
+                      >
+                        ⌨️ 手動入力
+                      </button>
+                    </div>
+
                     <div style={{ marginBottom: '12px', fontWeight: 'bold', fontSize: '1.1rem' }}>
                       {panningSplits.length === 0 ? '🏁 スタート地点を登録（0m地点）' : '⏱️ スプリット地点を登録'}
                     </div>
@@ -10126,64 +10186,104 @@ case 6: {
                         lineHeight: '1.5'
                       }}>
                         📍 スタート地点（0m）を登録してください。<br/>
-                        ビデオをスタート位置に移動してから「登録」ボタンを押してください。
+                        {panningInputMode === 'video' 
+                          ? 'ビデオをスタート位置に移動してから「登録」ボタンを押してください。'
+                          : 'タイムは自動的に0秒になります。「登録」ボタンを押してください。'}
                       </div>
                     )}
                     
                     {/* 距離入力（スタート後のみ表示） */}
                     {panningSplits.length > 0 && (
-                      <div style={{ marginBottom: '12px' }}>
-                        <label style={{ 
-                          display: 'block', 
-                          marginBottom: '6px',
-                          fontSize: '0.9rem',
-                          opacity: 0.9
-                        }}>
-                          📏 スプリット距離 (m):
-                        </label>
-                        <input
-                          type="number"
-                          value={distanceInput}
-                          onChange={(e) => setDistanceInput(e.target.value)}
-                          placeholder={`推奨: ${panningSplits[panningSplits.length - 1].distance + 10}m`}
-                          step="0.1"
-                          min="0.1"
-                          style={{
-                            width: '100%',
-                            padding: '10px',
-                            fontSize: '1rem',
-                            border: '2px solid rgba(255,255,255,0.3)',
-                            borderRadius: '8px',
-                            background: 'rgba(255,255,255,0.2)',
-                            color: 'white'
-                          }}
-                        />
-                        <div style={{
-                          marginTop: '6px',
-                          fontSize: '0.75rem',
-                          opacity: 0.8
-                        }}>
-                          💡 前回: {panningSplits[panningSplits.length - 1].distance.toFixed(1)}m
+                      <div>
+                        <div style={{ marginBottom: '12px' }}>
+                          <label style={{ 
+                            display: 'block', 
+                            marginBottom: '6px',
+                            fontSize: '0.9rem',
+                            opacity: 0.9
+                          }}>
+                            📏 スプリット距離 (m):
+                          </label>
+                          <input
+                            type="number"
+                            value={distanceInput}
+                            onChange={(e) => setDistanceInput(e.target.value)}
+                            placeholder={`推奨: ${panningSplits[panningSplits.length - 1].distance + 10}m`}
+                            step="0.1"
+                            min="0.1"
+                            style={{
+                              width: '100%',
+                              padding: '10px',
+                              fontSize: '1rem',
+                              border: '2px solid rgba(255,255,255,0.3)',
+                              borderRadius: '8px',
+                              background: 'rgba(255,255,255,0.2)',
+                              color: 'white'
+                            }}
+                          />
+                          <div style={{
+                            marginTop: '6px',
+                            fontSize: '0.75rem',
+                            opacity: 0.8
+                          }}>
+                            💡 前回: {panningSplits[panningSplits.length - 1].distance.toFixed(1)}m
+                          </div>
                         </div>
+
+                        {/* 手動タイム入力（手動モードのみ） */}
+                        {panningInputMode === 'manual' && (
+                          <div style={{ marginBottom: '12px' }}>
+                            <label style={{ 
+                              display: 'block', 
+                              marginBottom: '6px',
+                              fontSize: '0.9rem',
+                              opacity: 0.9
+                            }}>
+                              ⏱️ 通過タイム (秒):
+                            </label>
+                            <input
+                              type="number"
+                              value={manualTimeInput}
+                              onChange={(e) => setManualTimeInput(e.target.value)}
+                              placeholder="例: 2.45"
+                              step="0.01"
+                              min="0.01"
+                              style={{
+                                width: '100%',
+                                padding: '10px',
+                                fontSize: '1rem',
+                                border: '2px solid rgba(255,255,255,0.3)',
+                                borderRadius: '8px',
+                                background: 'rgba(255,255,255,0.2)',
+                                color: 'white'
+                              }}
+                            />
+                            <div style={{
+                              marginTop: '6px',
+                              fontSize: '0.75rem',
+                              opacity: 0.8
+                            }}>
+                              💡 前回: {panningSplits[panningSplits.length - 1].time.toFixed(3)}秒
+                            </div>
+                          </div>
+                        )}
                       </div>
                     )}
                     
                     {/* 登録ボタン */}
                     <button
                       onClick={() => {
-                        const frame = currentFrame;
-                        const time = usedTargetFps ? frame / usedTargetFps : 0;
-                        
                         // スタート地点（0m）の登録
                         if (panningSplits.length === 0) {
                           const newSplits: PanningSplit[] = [{ 
-                            frame, 
-                            time, 
+                            frame: 0, 
+                            time: 0, 
                             distance: 0 
                           }];
                           setPanningSplits(newSplits);
                           setPanningStartIndex(0); // 自動的に開始点に設定
                           setDistanceInput('10'); // 次の推奨距離（10m）を自動入力
+                          setManualTimeInput(''); // 手動タイム入力をクリア
                           return;
                         }
                         
@@ -10209,12 +10309,46 @@ case 6: {
                           return;
                         }
                         
+                        // タイムの取得（モードによって分岐）
+                        let time: number;
+                        let frame: number;
+                        
+                        if (panningInputMode === 'manual') {
+                          // 手動入力モード
+                          const inputTime = parseFloat(manualTimeInput);
+                          if (isNaN(inputTime) || inputTime <= 0) {
+                            alert('有効なタイムを入力してください（0より大きい数値）');
+                            return;
+                          }
+                          
+                          // 前の地点より大きいかチェック
+                          const lastTime = panningSplits[panningSplits.length - 1].time;
+                          if (inputTime <= lastTime) {
+                            alert(`${lastTime.toFixed(3)}秒より大きいタイムを入力してください`);
+                            return;
+                          }
+                          
+                          time = inputTime;
+                          frame = usedTargetFps ? Math.round(time * usedTargetFps) : 0;
+                        } else {
+                          // 動画モード
+                          frame = currentFrame;
+                          time = usedTargetFps ? frame / usedTargetFps : 0;
+                          
+                          // 前の地点より大きいかチェック
+                          const lastTime = panningSplits[panningSplits.length - 1].time;
+                          if (time <= lastTime) {
+                            alert(`前の地点（${lastTime.toFixed(3)}秒）より後のフレームを選択してください`);
+                            return;
+                          }
+                        }
+                        
                         const newSplits: PanningSplit[] = [...panningSplits, { 
                           frame, 
                           time, 
                           distance 
                         }];
-                        console.log(`✅ Split registered:`, {
+                        console.log(`✅ Split registered (${panningInputMode} mode):`, {
                           frame,
                           time,
                           distance,
@@ -10226,6 +10360,15 @@ case 6: {
                         // 次の推奨距離を自動入力（10m間隔）
                         const nextDistance = distance + 10;
                         setDistanceInput(nextDistance.toString());
+                        
+                        // 手動入力の場合は次の推奨タイムも設定
+                        if (panningInputMode === 'manual' && panningSplits.length >= 2) {
+                          const lastInterval = time - panningSplits[panningSplits.length - 1].time;
+                          const nextTime = time + lastInterval;
+                          setManualTimeInput(nextTime.toFixed(3));
+                        } else {
+                          setManualTimeInput('');
+                        }
                       }}
                       style={{
                         width: '100%',
@@ -10249,8 +10392,10 @@ case 6: {
                       }}
                     >
                       {panningSplits.length === 0 
-                        ? `🏁 スタート地点を登録 (フレーム ${currentFrame})` 
-                        : `➕ スプリット追加 (フレーム ${currentFrame})`
+                        ? '🏁 スタート地点を登録 (0m / 0秒)' 
+                        : panningInputMode === 'video'
+                          ? `➕ スプリット追加 (フレーム ${currentFrame})`
+                          : '➕ スプリット追加'
                       }
                     </button>
                     
