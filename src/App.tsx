@@ -28,7 +28,7 @@ import MobileSimplifier from './components/MobileSimplifier';
 import MobileHeader from './components/MobileHeader';
 import MultiCameraAnalyzer from "./components/MultiCameraAnalyzer";
 import { parseMedia } from "@remotion/media-parser";
-import { calculateHFVP, type HFVPResult, type StepDataForHFVP } from './utils/hfvpCalculator';
+import { calculateHFVP, calculateHFVPFromPanningSplits, type HFVPResult, type StepDataForHFVP, type PanningSplitDataForHFVP } from './utils/hfvpCalculator';
 
 /** ウィザードのステップ */
 type WizardStep = 0 | 1 | 2 | 3 | 3.5 | 4 | 5 | 5.5 | 6 | 6.5 | 7 | 8 | 9;
@@ -790,6 +790,13 @@ useEffect(() => {
   const [panningSplits, setPanningSplits] = useState<PanningSplit[]>([]);
   const [panningStartIndex, setPanningStartIndex] = useState<number | null>(null);
   const [panningEndIndex, setPanningEndIndex] = useState<number | null>(null);
+  const [panningZoomLevel, setPanningZoomLevel] = useState<number>(1); // ズームレベル (1=100%, 2=200%, etc.)
+  
+  // ドラッグ用のstate
+  const panningViewportRef = useRef<HTMLDivElement | null>(null);
+  const [isDragging, setIsDragging] = useState(false);
+  const [dragStart, setDragStart] = useState({ x: 0, y: 0 });
+  const [scrollStart, setScrollStart] = useState({ left: 0, top: 0 });
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const [videoWidth, setVideoWidth] = useState<number | null>(null);
@@ -2700,34 +2707,44 @@ const clearMarksByButton = () => {
       return null;
     }
     
-    // スプリットから速度データを生成
-    const hfvpSteps: StepDataForHFVP[] = [];
+    // スプリットからパンモード用データを生成
+    const panningSplitData: PanningSplitDataForHFVP[] = [];
     for (let i = 1; i < intervalSplits.length; i++) {
       const prevSplit = intervalSplits[i - 1];
       const currSplit = intervalSplits[i];
       const distanceDelta = currSplit.distance - prevSplit.distance;
       const timeDelta = currSplit.time - prevSplit.time;
-      const speed = distanceDelta / timeDelta;
+      const velocity = distanceDelta / timeDelta;
       
-      hfvpSteps.push({
-        distanceAtContactM: currSplit.distance,
-        speedMps: speed,
-        strideM: distanceDelta, // 近似値
-        contactTimeS: timeDelta * 0.5, // 近似値（接地時間を区間時間の半分と仮定）
-        flightTimeS: timeDelta * 0.5, // 近似値（滞空時間を区間時間の半分と仮定）
+      console.log(`🔍 H-FVP [PANNING] Split ${i}:`, {
+        prevFrame: prevSplit.frame,
+        currFrame: currSplit.frame,
+        prevTime: prevSplit.time.toFixed(4),
+        currTime: currSplit.time.toFixed(4),
+        timeDelta: timeDelta.toFixed(4),
+        distanceDelta: distanceDelta.toFixed(2),
+        velocity: velocity.toFixed(4)
+      });
+      
+      panningSplitData.push({
+        distance: currSplit.distance,
+        time: currSplit.time - intervalSplits[0].time, // Relative to start
+        velocity: velocity,
       });
     }
     
-    console.log(`🔍 H-FVP [PANNING]: Generated ${hfvpSteps.length} speed data points from splits`);
+    console.log(`🔍 H-FVP [PANNING]: Generated ${panningSplitData.length} split data points`);
+    console.log(`📊 H-FVP [PANNING]: Split data:`, panningSplitData);
+    console.log(`⚖️ H-FVP [PANNING]: Body mass: ${bodyMass}kg, Height: ${athleteHeight}m`);
     
-    const result = calculateHFVP(hfvpSteps, bodyMass, athleteHeight);
+    const result = calculateHFVPFromPanningSplits(panningSplitData, bodyMass, athleteHeight);
     
     if (result) {
       console.log(`✅ H-FVP [PANNING] calculated: ${result.quality.isValid ? 'SUCCESS' : 'FAILED'}`, result);
       
-      // パーン撮影モードの品質情報を追加
-      result.measurementMode = 'panning';
-      result.isPanningHighQuality = hfvpSteps.length >= 8;
+      // パーン撮影モードの品質情報は既に設定済み（calculateHFVPFromPanningSplitsで設定）
+    } else {
+      console.error(`❌ H-FVP [PANNING] calculation returned null. Check calculateHFVP function.`);
     }
     
     return result;
@@ -7381,6 +7398,10 @@ if (false /* multi mode disabled */ && isMultiCameraSetup) {
     */
 
     // 通常のシングルカメラモードのステップ処理
+    console.log('🔍 [CRITICAL] wizardStep =', wizardStep, 'analysisMode =', analysisMode);
+    console.log('🔍 [CRITICAL] typeof wizardStep =', typeof wizardStep);
+    console.log('🔍 [CRITICAL] wizardStep === 8 ?', wizardStep === 8);
+    console.log('🔍 [CRITICAL] wizardStep === 7 ?', wizardStep === 7);
     switch (wizardStep) {
       case 0:
       return (
@@ -8192,9 +8213,10 @@ if (false /* multi mode disabled */ && isMultiCameraSetup) {
             display: "flex",
             flexWrap: "wrap",
             gap: "8px",
+            alignItems: "center"
           }}
         >
-          {[60, 120, 240].map((fps) => (
+          {[30, 60, 120, 240].map((fps) => (
             <label
               key={fps}
               style={{
@@ -8227,6 +8249,43 @@ if (false /* multi mode disabled */ && isMultiCameraSetup) {
               {fps} fps
             </label>
           ))}
+          
+          {/* カスタムFPS入力 */}
+          <div style={{
+            display: "flex",
+            alignItems: "center",
+            gap: "8px",
+            padding: "6px 10px",
+            border: "1px solid #e5e7eb",
+            borderRadius: "8px",
+            background: "#f9fafb"
+          }}>
+            <label style={{ fontSize: "0.85rem", color: "#6b7280" }}>
+              カスタム:
+            </label>
+            <input
+              type="number"
+              min="1"
+              max="1000"
+              step="1"
+              placeholder="FPS"
+              onChange={(e) => {
+                const value = parseInt(e.target.value);
+                if (!isNaN(value) && value > 0) {
+                  setSelectedFps(value);
+                }
+              }}
+              style={{
+                width: "70px",
+                padding: "4px 8px",
+                border: "1px solid #d1d5db",
+                borderRadius: "6px",
+                fontSize: "0.9rem",
+                textAlign: "center"
+              }}
+            />
+            <span style={{ fontSize: "0.85rem", color: "#6b7280" }}>fps</span>
+          </div>
         </div>
       </div>
 
@@ -9725,7 +9784,7 @@ case 6: {
                   </button>
                 ) : (
                   <button className="btn-primary-large" onClick={() => setWizardStep(7)} disabled={contactFrames.length < 3}>
-                    次へ：解析結果
+                    次へ：評価とアドバイス
                   </button>
                 )}
               </div>
@@ -9777,12 +9836,12 @@ case 6: {
           <div className="wizard-content">
             <div className="wizard-step-header">
               <h2 className="wizard-step-title">
-                {analysisMode === 'panning' ? 'ステップ 7: パーン撮影結果' : 'ステップ 8: 解析結果'}
+                {analysisMode === 'panning' ? 'ステップ 7: パーン撮影結果' : 'ステップ 7: 評価とアドバイス'}
               </h2>
               <p className="wizard-step-desc">
                 {analysisMode === 'panning' 
                   ? 'フレームレートから算出したタイムと速度を表示します。'
-                  : 'ステップ解析結果とグラフを確認できます。スライダーで各フレームの角度を確認できます。'}
+                  : '走りの総合評価とトレーニングアドバイスを確認できます。'}
               </p>
             </div>
             
@@ -9853,20 +9912,172 @@ case 6: {
                   </div>
 
                   {/* 動画プレビュー */}
-                  <div style={{ marginBottom: '16px' }}>
-                    <canvas 
-                      ref={panningCanvasRef}
-                      style={{
-                        width: '100%',
-                        maxWidth: '1400px',
-                        height: 'auto',
-                        display: 'block',
+                  <div style={{ 
+                    marginBottom: '16px',
+                    position: 'relative'
+                  }}>
+                    {/* ズームコントロール */}
+                    <div style={{
+                      position: 'absolute',
+                      top: '10px',
+                      right: '10px',
+                      zIndex: 10,
+                      display: 'flex',
+                      flexDirection: 'column',
+                      gap: '8px',
+                      background: 'rgba(0,0,0,0.7)',
+                      padding: '8px',
+                      borderRadius: '8px',
+                      border: '1px solid rgba(255,255,255,0.3)'
+                    }}>
+                      <button
+                        onClick={() => setPanningZoomLevel(Math.min(panningZoomLevel + 0.5, 4))}
+                        style={{
+                          padding: '8px 12px',
+                          background: 'rgba(255,255,255,0.2)',
+                          color: 'white',
+                          border: '1px solid rgba(255,255,255,0.4)',
+                          borderRadius: '6px',
+                          cursor: 'pointer',
+                          fontSize: '1.2rem',
+                          fontWeight: 'bold'
+                        }}
+                      >
+                        +
+                      </button>
+                      <div style={{
+                        color: 'white',
+                        fontSize: '0.75rem',
+                        textAlign: 'center',
+                        padding: '4px'
+                      }}>
+                        {Math.round(panningZoomLevel * 100)}%
+                      </div>
+                      <button
+                        onClick={() => setPanningZoomLevel(Math.max(panningZoomLevel - 0.5, 0.5))}
+                        style={{
+                          padding: '8px 12px',
+                          background: 'rgba(255,255,255,0.2)',
+                          color: 'white',
+                          border: '1px solid rgba(255,255,255,0.4)',
+                          borderRadius: '6px',
+                          cursor: 'pointer',
+                          fontSize: '1.2rem',
+                          fontWeight: 'bold'
+                        }}
+                      >
+                        −
+                      </button>
+                      <button
+                        onClick={() => setPanningZoomLevel(1)}
+                        style={{
+                          padding: '6px 8px',
+                          background: 'rgba(255,255,255,0.2)',
+                          color: 'white',
+                          border: '1px solid rgba(255,255,255,0.4)',
+                          borderRadius: '6px',
+                          cursor: 'pointer',
+                          fontSize: '0.7rem'
+                        }}
+                      >
+                        リセット
+                      </button>
+                    </div>
+
+                    <div 
+                      ref={panningViewportRef}
+                      style={{ 
+                        overflow: 'auto',
+                        maxHeight: '80vh',
+                        WebkitOverflowScrolling: 'touch',
                         border: '2px solid rgba(255,255,255,0.3)',
                         borderRadius: '8px',
                         backgroundColor: '#000',
-                        margin: '0 auto'
+                        cursor: panningZoomLevel > 1 ? (isDragging ? 'grabbing' : 'grab') : 'default',
+                        userSelect: 'none'
                       }}
-                    />
+                      onMouseDown={(e) => {
+                        if (panningZoomLevel <= 1) return;
+                        setIsDragging(true);
+                        setDragStart({ x: e.clientX, y: e.clientY });
+                        const viewport = panningViewportRef.current;
+                        if (viewport) {
+                          setScrollStart({ left: viewport.scrollLeft, top: viewport.scrollTop });
+                        }
+                      }}
+                      onMouseMove={(e) => {
+                        if (!isDragging || panningZoomLevel <= 1) return;
+                        e.preventDefault();
+                        const viewport = panningViewportRef.current;
+                        if (viewport) {
+                          const dx = e.clientX - dragStart.x;
+                          const dy = e.clientY - dragStart.y;
+                          viewport.scrollLeft = scrollStart.left - dx;
+                          viewport.scrollTop = scrollStart.top - dy;
+                        }
+                      }}
+                      onMouseUp={() => setIsDragging(false)}
+                      onMouseLeave={() => setIsDragging(false)}
+                      onTouchStart={(e) => {
+                        if (panningZoomLevel <= 1 || e.touches.length !== 1) return;
+                        setIsDragging(true);
+                        const touch = e.touches[0];
+                        setDragStart({ x: touch.clientX, y: touch.clientY });
+                        const viewport = panningViewportRef.current;
+                        if (viewport) {
+                          setScrollStart({ left: viewport.scrollLeft, top: viewport.scrollTop });
+                        }
+                      }}
+                      onTouchMove={(e) => {
+                        if (!isDragging || panningZoomLevel <= 1 || e.touches.length !== 1) return;
+                        const touch = e.touches[0];
+                        const viewport = panningViewportRef.current;
+                        if (viewport) {
+                          const dx = touch.clientX - dragStart.x;
+                          const dy = touch.clientY - dragStart.y;
+                          viewport.scrollLeft = scrollStart.left - dx;
+                          viewport.scrollTop = scrollStart.top - dy;
+                        }
+                      }}
+                      onTouchEnd={() => setIsDragging(false)}
+                    >
+                      <div style={{
+                        display: 'inline-block',
+                        position: 'relative'
+                      }}>
+                        <canvas 
+                          ref={panningCanvasRef}
+                          style={{
+                            width: '100%',
+                            height: 'auto',
+                            display: 'block',
+                            pointerEvents: 'none',
+                            transform: `scale(${panningZoomLevel})`,
+                            transformOrigin: 'top left'
+                          }}
+                        />
+                        {/* スクロール領域を確保するための透明なスペーサー */}
+                        <div style={{
+                          position: 'absolute',
+                          top: 0,
+                          left: 0,
+                          width: `${panningZoomLevel * 100}%`,
+                          height: `${panningZoomLevel * 100}%`,
+                          pointerEvents: 'none'
+                        }} />
+                      </div>
+                    </div>
+                    <div style={{
+                      marginTop: '8px',
+                      padding: '8px',
+                      background: 'rgba(0,0,0,0.5)',
+                      color: 'white',
+                      fontSize: '0.75rem',
+                      textAlign: 'center',
+                      borderRadius: '8px'
+                    }}>
+                      📱 右上のボタンで拡大・縮小、ドラッグ（またはスワイプ）で画像を移動できます
+                    </div>
                   </div>
 
                   {/* フレームスライダー */}
@@ -9901,60 +10112,87 @@ case 6: {
                     color: 'white'
                   }}>
                     <div style={{ marginBottom: '12px', fontWeight: 'bold', fontSize: '1.1rem' }}>
-                      {panningSplits.length === 0 ? '🏁 スタート地点を登録' : '⏱️ スプリット地点を登録'}
+                      {panningSplits.length === 0 ? '🏁 スタート地点を登録（0m地点）' : '⏱️ スプリット地点を登録'}
                     </div>
                     
-                    {/* 距離入力 */}
-                    <div style={{ marginBottom: '12px' }}>
-                      <label style={{ 
-                        display: 'block', 
-                        marginBottom: '6px',
-                        fontSize: '0.9rem',
-                        opacity: 0.9
+                    {/* スタート地点の説明 */}
+                    {panningSplits.length === 0 && (
+                      <div style={{
+                        marginBottom: '12px',
+                        padding: '10px',
+                        background: 'rgba(255,255,255,0.2)',
+                        borderRadius: '8px',
+                        fontSize: '0.85rem',
+                        lineHeight: '1.5'
                       }}>
-                        📏 距離 (m):
-                      </label>
-                      <input
-                        type="number"
-                        value={distanceInput}
-                        onChange={(e) => setDistanceInput(e.target.value)}
-                        placeholder={panningSplits.length === 0 ? "0" : `例: ${parseFloat(distanceInput) || 10}`}
-                        step="0.1"
-                        min="0"
-                        style={{
-                          width: '100%',
-                          padding: '10px',
-                          fontSize: '1rem',
-                          border: '2px solid rgba(255,255,255,0.3)',
-                          borderRadius: '8px',
-                          background: 'rgba(255,255,255,0.2)',
-                          color: 'white'
-                        }}
-                      />
-                    </div>
+                        📍 スタート地点（0m）を登録してください。<br/>
+                        ビデオをスタート位置に移動してから「登録」ボタンを押してください。
+                      </div>
+                    )}
+                    
+                    {/* 距離入力（スタート後のみ表示） */}
+                    {panningSplits.length > 0 && (
+                      <div style={{ marginBottom: '12px' }}>
+                        <label style={{ 
+                          display: 'block', 
+                          marginBottom: '6px',
+                          fontSize: '0.9rem',
+                          opacity: 0.9
+                        }}>
+                          📏 スプリット距離 (m):
+                        </label>
+                        <input
+                          type="number"
+                          value={distanceInput}
+                          onChange={(e) => setDistanceInput(e.target.value)}
+                          placeholder={`推奨: ${panningSplits[panningSplits.length - 1].distance + 10}m`}
+                          step="0.1"
+                          min="0.1"
+                          style={{
+                            width: '100%',
+                            padding: '10px',
+                            fontSize: '1rem',
+                            border: '2px solid rgba(255,255,255,0.3)',
+                            borderRadius: '8px',
+                            background: 'rgba(255,255,255,0.2)',
+                            color: 'white'
+                          }}
+                        />
+                        <div style={{
+                          marginTop: '6px',
+                          fontSize: '0.75rem',
+                          opacity: 0.8
+                        }}>
+                          💡 前回: {panningSplits[panningSplits.length - 1].distance.toFixed(1)}m
+                        </div>
+                      </div>
+                    )}
                     
                     {/* 登録ボタン */}
                     <button
                       onClick={() => {
                         const frame = currentFrame;
                         const time = usedTargetFps ? frame / usedTargetFps : 0;
+                        
+                        // スタート地点（0m）の登録
+                        if (panningSplits.length === 0) {
+                          const newSplits: PanningSplit[] = [{ 
+                            frame, 
+                            time, 
+                            distance: 0 
+                          }];
+                          setPanningSplits(newSplits);
+                          setPanningStartIndex(0); // 自動的に開始点に設定
+                          setDistanceInput('10'); // 次の推奨距離（10m）を自動入力
+                          return;
+                        }
+                        
+                        // スプリット地点の登録
                         const distance = parseFloat(distanceInput);
                         
                         // 数値チェック
-                        if (isNaN(distance) || distance < 0) {
-                          alert('有効な距離を入力してください（0以上の数値）');
-                          return;
-                        }
-                        
-                        // スタート地点は0m必須
-                        if (panningSplits.length === 0 && distance !== 0) {
-                          alert('最初はスタート地点（0m）を登録してください');
-                          return;
-                        }
-                        
-                        // 2地点目以降は0より大きい必要
-                        if (panningSplits.length > 0 && distance <= 0) {
-                          alert('0mより大きい距離を入力してください');
+                        if (isNaN(distance) || distance <= 0) {
+                          alert('有効な距離を入力してください（0より大きい数値）');
                           return;
                         }
                         
@@ -9964,19 +10202,30 @@ case 6: {
                           return;
                         }
                         
-                        const newSplits: PanningSplit[] = [...(panningSplits || []), { 
+                        // 前の地点より大きいかチェック
+                        const lastDistance = panningSplits[panningSplits.length - 1].distance;
+                        if (distance <= lastDistance) {
+                          alert(`${lastDistance}mより大きい距離を入力してください`);
+                          return;
+                        }
+                        
+                        const newSplits: PanningSplit[] = [...panningSplits, { 
                           frame, 
                           time, 
                           distance 
                         }];
+                        console.log(`✅ Split registered:`, {
+                          frame,
+                          time,
+                          distance,
+                          fps: usedTargetFps,
+                          previousSplits: panningSplits.map(s => ({ frame: s.frame, time: s.time, dist: s.distance }))
+                        });
                         setPanningSplits(newSplits);
                         
-                        // 次の距離提案
-                        if (panningSplits.length === 0) {
-                          setDistanceInput('10'); // スタート後は10m
-                        } else {
-                          setDistanceInput(String(distance + 10));
-                        }
+                        // 次の推奨距離を自動入力（10m間隔）
+                        const nextDistance = distance + 10;
+                        setDistanceInput(nextDistance.toString());
                       }}
                       style={{
                         width: '100%',
@@ -10013,6 +10262,99 @@ case 6: {
                         textAlign: 'center'
                       }}>
                         💡 まずスタート地点（0m）を登録してください
+                      </div>
+                    )}
+                    
+                    {/* 登録済みスプリット一覧 */}
+                    {panningSplits.length > 0 && (
+                      <div style={{
+                        marginTop: '16px',
+                        padding: '12px',
+                        background: 'rgba(255,255,255,0.15)',
+                        borderRadius: '8px'
+                      }}>
+                        <div style={{ fontWeight: 'bold', marginBottom: '8px', fontSize: '0.95rem' }}>
+                          📊 登録済みスプリット
+                        </div>
+                        <div style={{ fontSize: '0.85rem' }}>
+                          {panningSplits.map((split, idx) => {
+                            // スプリットタイム（前の地点からの区間タイム）
+                            const splitTime = idx === 0 ? 0 : split.time - panningSplits[idx - 1].time;
+                            // 累計タイム（0m地点からの累計）
+                            const cumulativeTime = split.time - panningSplits[0].time;
+                            // スプリット距離（前の地点からの距離）
+                            const splitDistance = idx === 0 ? 0 : split.distance - panningSplits[idx - 1].distance;
+                            // 区間速度
+                            const splitSpeed = idx === 0 ? 0 : splitDistance / splitTime;
+                            
+                            return (
+                              <div 
+                                key={idx}
+                                style={{
+                                  display: 'flex',
+                                  justifyContent: 'space-between',
+                                  alignItems: 'center',
+                                  padding: '8px',
+                                  marginBottom: idx < panningSplits.length - 1 ? '6px' : '0',
+                                  background: idx === 0 ? 'rgba(34, 197, 94, 0.2)' : 'rgba(255,255,255,0.1)',
+                                  borderRadius: '6px',
+                                  borderLeft: idx === 0 ? '3px solid #22c55e' : '3px solid rgba(255,255,255,0.3)'
+                                }}
+                              >
+                                <div style={{ flex: 1 }}>
+                                  <div style={{ fontWeight: 'bold' }}>
+                                    {idx === 0 ? '🏁 ' : '⏱️ '}{split.distance.toFixed(1)}m
+                                  </div>
+                                  {idx > 0 && (
+                                    <div style={{ fontSize: '0.75rem', opacity: 0.9, marginTop: '2px' }}>
+                                      区間: {splitDistance.toFixed(1)}m / {splitTime.toFixed(3)}s
+                                      {' '}({splitSpeed.toFixed(2)}m/s)
+                                    </div>
+                                  )}
+                                </div>
+                                <div style={{ textAlign: 'right' }}>
+                                  <div style={{ fontWeight: 'bold' }}>
+                                    累計: {cumulativeTime.toFixed(3)}s
+                                  </div>
+                                  {idx > 0 && (
+                                    <div style={{ fontSize: '0.75rem', opacity: 0.9, marginTop: '2px' }}>
+                                      ラップ: {splitTime.toFixed(3)}s
+                                    </div>
+                                  )}
+                                </div>
+                                <button
+                                  onClick={() => {
+                                    if (window.confirm(`${split.distance.toFixed(1)}m地点を削除しますか？`)) {
+                                      const newSplits = panningSplits.filter((_, i) => i !== idx);
+                                      setPanningSplits(newSplits);
+                                      // インデックスのリセット
+                                      if (panningStartIndex === idx) setPanningStartIndex(null);
+                                      if (panningEndIndex === idx) setPanningEndIndex(null);
+                                      if (panningStartIndex !== null && panningStartIndex > idx) {
+                                        setPanningStartIndex(panningStartIndex - 1);
+                                      }
+                                      if (panningEndIndex !== null && panningEndIndex > idx) {
+                                        setPanningEndIndex(panningEndIndex - 1);
+                                      }
+                                    }
+                                  }}
+                                  style={{
+                                    marginLeft: '8px',
+                                    padding: '4px 8px',
+                                    fontSize: '0.75rem',
+                                    background: 'rgba(239, 68, 68, 0.3)',
+                                    border: '1px solid rgba(239, 68, 68, 0.5)',
+                                    borderRadius: '4px',
+                                    color: 'white',
+                                    cursor: 'pointer'
+                                  }}
+                                >
+                                  ✕
+                                </button>
+                              </div>
+                            );
+                          })}
+                        </div>
                       </div>
                     )}
                   </div>
@@ -10240,8 +10582,10 @@ case 6: {
                         textAlign: 'center'
                       }}>
                         <div style={{ fontSize: '0.85rem', opacity: 0.9, marginBottom: '4px' }}>F0</div>
-                        <div style={{ fontSize: '1.5rem', fontWeight: 'bold' }}>{hfvpResult.F0.toFixed(1)}</div>
-                        <div style={{ fontSize: '0.75rem', opacity: 0.8 }}>N</div>
+                        <div style={{ fontSize: '1.5rem', fontWeight: 'bold' }}>
+                          {(hfvpResult.F0 / (athleteInfo.weight_kg || 70)).toFixed(2)}
+                        </div>
+                        <div style={{ fontSize: '0.75rem', opacity: 0.8 }}>N/kg</div>
                       </div>
                       <div style={{
                         padding: '16px',
@@ -10529,6 +10873,339 @@ case 6: {
                     )}
                   </div>
                 )}
+              </div>
+            )}
+
+            {/* 固定カメラモード: 評価とアドバイス */}
+            {analysisMode !== 'panning' && (
+              <div className="result-card">
+                <h3 className="result-card-title">🎯 走りの評価とアドバイス</h3>
+                
+                {stepMetrics.length > 0 ? (
+                  <>
+                    <div style={{
+                      padding: '20px',
+                      background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
+                      borderRadius: '12px',
+                      color: 'white',
+                      marginBottom: '20px'
+                    }}>
+                      <h4 style={{ margin: '0 0 16px 0', fontSize: '1.1rem' }}>📊 総合評価</h4>
+                      <div style={{ fontSize: '0.95rem', lineHeight: '1.8' }}>
+                        <p>✅ {stepMetrics.length}歩のステップを検出しました</p>
+                        <p>✅ 平均ストライド: {(stepMetrics.reduce((sum, m) => sum + (m.stride || 0), 0) / stepMetrics.length).toFixed(2)}m</p>
+                        <p>✅ 平均ピッチ: {(stepMetrics.reduce((sum, m) => sum + (m.stepPitch || 0), 0) / stepMetrics.length).toFixed(1)} steps/min</p>
+                        <p>✅ 平均速度: {(stepMetrics.reduce((sum, m) => sum + (m.speedMps || 0), 0) / stepMetrics.length).toFixed(2)} m/s</p>
+                      </div>
+                    </div>
+
+                    <div style={{
+                      padding: '20px',
+                      background: '#f0f9ff',
+                      borderRadius: '12px',
+                      border: '2px solid #3b82f6',
+                      marginBottom: '20px'
+                    }}>
+                      <h4 style={{ margin: '0 0 16px 0', color: '#1e40af', fontSize: '1.1rem' }}>💡 トレーニングアドバイス</h4>
+                      <div style={{ fontSize: '0.95rem', lineHeight: '1.8', color: '#1e3a8a' }}>
+                        <p><strong>ストライド向上のために:</strong></p>
+                        <ul style={{ marginLeft: '20px', marginBottom: '12px' }}>
+                          <li>股関節の可動域を広げるストレッチを行いましょう</li>
+                          <li>ランジやスクワットで下半身の筋力を強化しましょう</li>
+                        </ul>
+                        <p><strong>ピッチ向上のために:</strong></p>
+                        <ul style={{ marginLeft: '20px' }}>
+                          <li>腕振りのリズムを意識して走りましょう</li>
+                          <li>短い距離でのピッチ走を取り入れましょう</li>
+                        </ul>
+                      </div>
+                    </div>
+
+                    {/* AI フォーム評価セクション */}
+                    {runningEvaluation && (
+                      <div style={{
+                        marginTop: '20px',
+                        padding: '20px',
+                        background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
+                        borderRadius: '12px',
+                        color: 'white'
+                      }}>
+                        <h4 style={{ marginBottom: '16px', fontSize: '1.1rem', fontWeight: 'bold', color: 'white' }}>
+                          🤖 AI フォーム評価
+                        </h4>
+                        
+                        {/* 総合評価 */}
+                        <div style={{
+                          padding: '20px',
+                          background: 'rgba(255,255,255,0.15)',
+                          borderRadius: '12px',
+                          marginBottom: '20px',
+                          textAlign: 'center'
+                        }}>
+                          <div style={{ fontSize: '1.5rem', fontWeight: 'bold', marginBottom: '8px' }}>
+                            {runningEvaluation.overallRating}
+                          </div>
+                          <div style={{ fontSize: '0.95rem', opacity: 0.9 }}>
+                            {runningEvaluation.overallMessage}
+                          </div>
+                          <div style={{ 
+                            marginTop: '12px', 
+                            display: 'flex', 
+                            gap: '4px', 
+                            justifyContent: 'center',
+                            alignItems: 'center'
+                          }}>
+                            {[1, 2, 3, 4].map(i => (
+                              <div
+                                key={i}
+                                style={{
+                                  width: '40px',
+                                  height: '8px',
+                                  borderRadius: '4px',
+                                  background: i <= runningEvaluation.avgScore 
+                                    ? 'rgba(255,255,255,0.9)' 
+                                    : 'rgba(255,255,255,0.2)'
+                                }}
+                              />
+                            ))}
+                          </div>
+                        </div>
+
+                        {/* 詳細評価 */}
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+                          {runningEvaluation.evaluations.map((evaluation, index) => (
+                            <div
+                              key={index}
+                              style={{
+                                padding: '16px',
+                                background: 'rgba(255,255,255,0.1)',
+                                borderRadius: '12px',
+                                borderLeft: '4px solid ' + (
+                                  evaluation.score === 'excellent' ? '#10b981' :
+                                  evaluation.score === 'good' ? '#3b82f6' :
+                                  evaluation.score === 'fair' ? '#f59e0b' :
+                                  '#ef4444'
+                                )
+                              }}
+                            >
+                              <div style={{ 
+                                display: 'flex', 
+                                alignItems: 'center', 
+                                gap: '8px',
+                                marginBottom: '8px'
+                              }}>
+                                <span style={{ fontSize: '1.5rem' }}>{evaluation.icon}</span>
+                                <div>
+                                  <div style={{ fontWeight: 'bold', fontSize: '1rem' }}>
+                                    {evaluation.category}
+                                  </div>
+                                  <div style={{ fontSize: '0.85rem', opacity: 0.9 }}>
+                                    {evaluation.message}
+                                  </div>
+                                </div>
+                              </div>
+                              <div style={{ 
+                                fontSize: '0.85rem', 
+                                lineHeight: '1.5',
+                                opacity: 0.85,
+                                paddingLeft: '36px'
+                              }}>
+                                💡 {evaluation.advice}
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* 100m目標記録アドバイス */}
+                    <div style={{
+                      marginTop: '20px',
+                      padding: '20px',
+                      background: '#ffffff',
+                      borderRadius: '12px',
+                      border: '2px solid #e5e7eb'
+                    }}>
+                      <h4 style={{ margin: '0 0 16px 0', fontSize: '1.1rem', fontWeight: 'bold', color: '#1f2937', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                        🎯 100m 目標記録達成アドバイス
+                      </h4>
+                      
+                      {athleteInfo.target_record && (
+                        <div style={{
+                          padding: '12px 16px',
+                          background: 'linear-gradient(135deg, #f0f9ff 0%, #e0f2fe 100%)',
+                          borderRadius: '8px',
+                          marginBottom: '16px',
+                          border: '1px solid #7dd3fc'
+                        }}>
+                          <div style={{ fontSize: '0.85rem', color: '#0369a1', marginBottom: '4px' }}>
+                            📋 設定された目標記録
+                          </div>
+                          <div style={{ fontSize: '1.2rem', fontWeight: 'bold', color: '#0c4a6e' }}>
+                            {athleteInfo.target_record}
+                          </div>
+                        </div>
+                      )}
+
+                      {athleteInfo.target_record && (() => {
+                        const targetTime = parseFloat(athleteInfo.target_record.replace(/[^0-9.]/g, ''));
+                        if (!isNaN(targetTime) && targetTime > 0) {
+                          const currentAnalysisType: 'acceleration' | 'topSpeed' = runType === 'dash' ? 'acceleration' : 'topSpeed';
+                          const advice = generateTargetAdvice(targetTime, currentAnalysisType);
+                          return (
+                            <div style={{
+                              padding: '20px',
+                              background: '#f9fafb',
+                              borderRadius: '8px',
+                              fontSize: '0.9rem',
+                              lineHeight: '1.8',
+                              maxHeight: '500px',
+                              overflowY: 'auto',
+                              color: '#1f2937'
+                            }}>
+                              {advice.split('\n').map((line, i) => {
+                                if (line.startsWith('### ')) {
+                                  return (
+                                    <h3 key={i} style={{
+                                      fontSize: '1.2rem',
+                                      fontWeight: 'bold',
+                                      marginTop: i === 0 ? '0' : '20px',
+                                      marginBottom: '10px',
+                                      color: '#1f2937',
+                                      borderBottom: '2px solid #667eea',
+                                      paddingBottom: '6px'
+                                    }}>
+                                      {line.replace('### ', '')}
+                                    </h3>
+                                  );
+                                }
+                                if (line.startsWith('#### ')) {
+                                  return (
+                                    <h4 key={i} style={{
+                                      fontSize: '1.05rem',
+                                      fontWeight: 'bold',
+                                      marginTop: '14px',
+                                      marginBottom: '8px',
+                                      color: '#374151'
+                                    }}>
+                                      {line.replace('#### ', '')}
+                                    </h4>
+                                  );
+                                }
+                                if (line.startsWith('## ')) {
+                                  return (
+                                    <h2 key={i} style={{
+                                      fontSize: '1.4rem',
+                                      fontWeight: 'bold',
+                                      marginTop: i === 0 ? '0' : '24px',
+                                      marginBottom: '12px',
+                                      color: '#111827',
+                                      borderBottom: '3px solid #764ba2',
+                                      paddingBottom: '8px'
+                                    }}>
+                                      {line.replace('## ', '')}
+                                    </h2>
+                                  );
+                                }
+                                if (line.trim().startsWith('- ')) {
+                                  return (
+                                    <div key={i} style={{
+                                      marginLeft: '16px',
+                                      marginBottom: '4px',
+                                      display: 'flex',
+                                      gap: '6px'
+                                    }}>
+                                      <span style={{ color: '#667eea', fontWeight: 'bold' }}>•</span>
+                                      <span>{line.trim().replace('- ', '')}</span>
+                                    </div>
+                                  );
+                                }
+                                if (/^\d+\./.test(line.trim())) {
+                                  return (
+                                    <div key={i} style={{
+                                      marginLeft: '16px',
+                                      marginBottom: '4px',
+                                      display: 'flex',
+                                      gap: '6px'
+                                    }}>
+                                      <span style={{ 
+                                        color: '#764ba2', 
+                                        fontWeight: 'bold',
+                                        minWidth: '20px'
+                                      }}>
+                                        {line.trim().match(/^\d+\./)?.[0]}
+                                      </span>
+                                      <span>{line.trim().replace(/^\d+\.\s*/, '')}</span>
+                                    </div>
+                                  );
+                                }
+                                if (line.trim().startsWith('> ')) {
+                                  return (
+                                    <div key={i} style={{
+                                      background: '#eff6ff',
+                                      borderLeft: '4px solid #667eea',
+                                      padding: '10px 14px',
+                                      marginTop: '10px',
+                                      marginBottom: '10px',
+                                      borderRadius: '0 6px 6px 0',
+                                      fontStyle: 'italic',
+                                      color: '#4b5563'
+                                    }}>
+                                      {line.replace('> ', '')}
+                                    </div>
+                                  );
+                                }
+                                if (line.trim() === '---') {
+                                  return (
+                                    <hr key={i} style={{
+                                      border: 'none',
+                                      borderTop: '2px solid #e5e7eb',
+                                      margin: '20px 0'
+                                    }} />
+                                  );
+                                }
+                                if (line.includes('**')) {
+                                  const parts = line.split('**');
+                                  return (
+                                    <p key={i} style={{ marginBottom: '6px', color: '#374151' }}>
+                                      {parts.map((part, j) => 
+                                        j % 2 === 1 ? <strong key={j} style={{ color: '#1f2937', fontWeight: 'bold' }}>{part}</strong> : part
+                                      )}
+                                    </p>
+                                  );
+                                }
+                                return line ? <p key={i} style={{ marginBottom: '6px', color: '#374151' }}>{line}</p> : <br key={i} />;
+                              })}
+                            </div>
+                          );
+                        }
+                        return null;
+                      })()}
+                    </div>
+                  </>
+                ) : (
+                  <p>ステップメトリクスが計算されていません。Step 6 でマーカーを設定してください。</p>
+                )}
+
+                <div style={{ display: 'flex', gap: '12px', marginTop: '20px' }}>
+                  <button
+                    className="wizard-btn secondary"
+                    onClick={() => setWizardStep(6)}
+                  >
+                    前へ: マーカー設定
+                  </button>
+                  <button
+                    className="wizard-btn"
+                    onClick={() => setWizardStep(8)}
+                    style={{
+                      background: 'linear-gradient(135deg, #06b6d4 0%, #0891b2 100%)',
+                      border: 'none',
+                      boxShadow: '0 4px 12px rgba(6, 182, 212, 0.4)'
+                    }}
+                  >
+                    次へ: 詳細データ
+                  </button>
+                </div>
               </div>
             )}
 
@@ -11255,10 +11932,14 @@ case 6: {
       }
 
       case 8:
+        console.log('✅ [STEP 8] Rendering Step 8! stepMetrics.length =', stepMetrics.length);
+        console.log('✅ [STEP 8] analysisMode =', analysisMode);
+        console.log('✅ [STEP 8] contactFrames.length =', contactFrames.length);
+        console.log('✅ [STEP 8] stepMetrics =', stepMetrics);
         return (
           <div className="wizard-content">
             <div className="wizard-step-header">
-              <h2 className="wizard-step-title">ステップ 9: データ詳細（プロ版）</h2>
+              <h2 className="wizard-step-title">ステップ 8: 解析結果</h2>
               <p className="wizard-step-desc">
                 詳細なステップメトリクス、グラフ、関節角度データを確認できます。
               </p>
@@ -11619,8 +12300,10 @@ case 6: {
                             textAlign: 'center'
                           }}>
                             <div style={{ fontSize: '0.85rem', opacity: 0.9, marginBottom: '4px' }}>F0</div>
-                            <div style={{ fontSize: '1.5rem', fontWeight: 'bold' }}>{hfvpResult.F0.toFixed(1)}</div>
-                            <div style={{ fontSize: '0.75rem', opacity: 0.8 }}>N</div>
+                            <div style={{ fontSize: '1.5rem', fontWeight: 'bold' }}>
+                              {(hfvpResult.F0 / (athleteInfo.weight_kg || 70)).toFixed(2)}
+                            </div>
+                            <div style={{ fontSize: '0.75rem', opacity: 0.8 }}>N/kg</div>
                           </div>
                           <div style={{
                             padding: '16px',
@@ -12616,7 +13299,20 @@ case 6: {
         );
 
       default:
-        return null;
+        console.error('❌ [DEFAULT CASE] Unexpected wizardStep:', wizardStep, 'analysisMode:', analysisMode);
+        return (
+          <div className="wizard-content">
+            <div className="wizard-step-header">
+              <h2 className="wizard-step-title" style={{ color: 'red' }}>エラー: 不明なステップ</h2>
+              <p className="wizard-step-desc">
+                wizardStep = {wizardStep}, analysisMode = {analysisMode}
+              </p>
+              <button className="btn-primary" onClick={() => setWizardStep(0)}>
+                最初に戻る
+              </button>
+            </div>
+          </div>
+        );
     }
   };
 

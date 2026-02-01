@@ -71,6 +71,15 @@ export interface StepDataForHFVP {
 }
 
 /**
+ * Split data for panning mode (simplified, no contact/flight time needed)
+ */
+export interface PanningSplitDataForHFVP {
+  distance: number;    // Distance from start (m)
+  time: number;        // Time from start (s)
+  velocity: number;    // Average velocity in this segment (m/s)
+}
+
+/**
  * Calculate H-FVP from step data using Samozino method
  * 
  * @param steps - Array of step data from single-camera analysis
@@ -253,9 +262,11 @@ export function calculateHFVP(
   
   // RFmax: Maximum ratio of force (at start, lowest velocity)
   // RF = F_horizontal / F_resultant
-  // At start: F_horizontal = F0, F_resultant ≈ √(F0² + (m*g)²)
-  const startResultantForce = Math.sqrt(F0 * F0 + (bodyMassKg * g) * (bodyMassKg * g));
-  const RFmax = startResultantForce > 0 ? (F0 / startResultantForce) * 100 : 0;
+  // Use the first data point (lowest velocity) for RFmax calculation
+  const firstDataPoint = validDataPoints[0];
+  const RFmax = firstDataPoint.resultantForce > 0 
+    ? (firstDataPoint.horizontalForce / firstDataPoint.resultantForce) * 100 
+    : 0;
   
   // DRF: Decrease in ratio of force per unit velocity
   // DRF = -100 * d(RF)/dv
@@ -513,4 +524,237 @@ export function generateTrainingRecommendations(hfvp: HFVPResult): string[] {
   }
   
   return recommendations;
+}
+
+/**
+ * Calculate H-FVP from panning mode split data
+ * Simplified calculation using only distance, time, and velocity
+ * 
+ * @param splits - Array of split data from panning mode
+ * @param bodyMassKg - Athlete's body mass (kg)
+ * @param athleteHeightM - Athlete's height (m)
+ * @returns HFVPResult or null if insufficient data
+ */
+export function calculateHFVPFromPanningSplits(
+  splits: PanningSplitDataForHFVP[],
+  bodyMassKg: number,
+  athleteHeightM: number = 1.75
+): HFVPResult | null {
+  console.log(`\n📊 === H-FVP Calculation (Panning Mode) ===`);
+  console.log(`   Body mass: ${bodyMassKg.toFixed(1)} kg`);
+  console.log(`   Height: ${athleteHeightM.toFixed(2)} m`);
+  console.log(`   Total splits: ${splits.length}`);
+  
+  // Validation
+  if (splits.length < 3) {
+    console.warn('⚠️ Not enough splits for H-FVP calculation (minimum: 3)');
+    return null;
+  }
+  
+  if (bodyMassKg <= 0 || bodyMassKg > 200) {
+    console.warn('⚠️ Invalid body mass for H-FVP calculation');
+    return null;
+  }
+  
+  if (athleteHeightM <= 0 || athleteHeightM > 2.5) {
+    console.warn('⚠️ Invalid height for H-FVP calculation');
+    return null;
+  }
+  
+  const g = 9.81; // Gravity (m/s²)
+  const warnings: string[] = [];
+  
+  // Calculate data points from splits
+  const dataPoints: HFVPResult['dataPoints'] = [];
+  const velocities: number[] = [];
+  const horizontalForces: number[] = [];
+  
+  for (let i = 0; i < splits.length; i++) {
+    const split = splits[i];
+    const velocity = split.velocity;
+    velocities.push(velocity);
+    
+    // Calculate acceleration from velocity change
+    let acceleration = 0;
+    if (i < splits.length - 1) {
+      const nextSplit = splits[i + 1];
+      const deltaV = nextSplit.velocity - velocity;
+      const deltaT = nextSplit.time - split.time;
+      
+      if (deltaT > 0) {
+        acceleration = deltaV / deltaT;
+      }
+    } else if (i > 0) {
+      // Last split: use previous acceleration
+      const prevSplit = splits[i - 1];
+      const deltaV = velocity - prevSplit.velocity;
+      const deltaT = split.time - prevSplit.time;
+      
+      if (deltaT > 0) {
+        acceleration = deltaV / deltaT;
+      }
+    }
+    
+    // Air resistance (drag force)
+    const rho = 1.225; // kg/m³
+    const Cd = 0.9;
+    const frontalArea = 0.2025 * athleteHeightM * athleteHeightM; // m²
+    const dragForce = 0.5 * rho * Cd * frontalArea * velocity * velocity;
+    
+    // Net horizontal force (Newton's 2nd law + air resistance)
+    const horizontalForce = bodyMassKg * acceleration + dragForce;
+    horizontalForces.push(horizontalForce);
+    
+    // Estimate contact angle
+    const maxVelocity = Math.max(...velocities);
+    const velocityRatio = maxVelocity > 0 ? velocity / maxVelocity : 0;
+    const contactAngle = 60 - 15 * velocityRatio; // degrees (60° → 45°)
+    
+    // Vertical force (constant body weight support)
+    const verticalForce = bodyMassKg * g;
+    
+    // Resultant force
+    const resultantForce = Math.sqrt(
+      horizontalForce * horizontalForce + 
+      verticalForce * verticalForce
+    );
+    
+    // Power = F_horizontal * v
+    const power = horizontalForce * velocity;
+    
+    // Force ratio: RF = F_horizontal / F_resultant
+    const forceRatio = resultantForce > 0 
+      ? (horizontalForce / resultantForce) * 100 
+      : 0;
+    
+    console.log(`   Split ${i}: v=${velocity.toFixed(2)} m/s, a=${acceleration.toFixed(2)} m/s², F_h=${horizontalForce.toFixed(1)} N, RF=${forceRatio.toFixed(1)}%`);
+    
+    dataPoints.push({
+      velocity,
+      horizontalForce,
+      verticalForce,
+      resultantForce,
+      power,
+      forceRatio,
+      distance: split.distance,
+      acceleration,
+      contactAngle,
+    });
+  }
+  
+  console.log(`   Data points generated: ${dataPoints.length}`);
+  
+  // Linear regression: F_horizontal = F0 - (F0/V0) * velocity
+  const { slope, intercept, rSquared } = linearRegression(
+    dataPoints.map(p => p.velocity),
+    dataPoints.map(p => p.horizontalForce)
+  );
+  
+  console.log(`   Regression - Slope: ${slope.toFixed(2)}, Intercept: ${intercept.toFixed(2)}, R²: ${rSquared.toFixed(3)}`);
+  
+  // F0: Maximum horizontal force (when velocity = 0)
+  const F0 = intercept;
+  
+  // V0: Theoretical maximum velocity (when force = 0)
+  const FVSlope = -slope;
+  const V0 = FVSlope !== 0 ? F0 / FVSlope : 0;
+  
+  console.log(`   F0: ${F0.toFixed(2)} N, V0: ${V0.toFixed(2)} m/s`);
+  
+  // Validation
+  if (F0 <= 0 || V0 <= 0 || !isFinite(F0) || !isFinite(V0)) {
+    console.error(`❌ calculateHFVP (hfvpCalculator.ts): Invalid F0 or V0`, { F0, V0, slope, intercept });
+    return null;
+  }
+  
+  // Pmax: Maximum power = F0 * V0 / 4
+  const Pmax = (F0 * V0) / 4;
+  
+  // RFmax: Maximum ratio of force (at first data point)
+  const firstDataPoint = dataPoints[0];
+  const RFmax = firstDataPoint.resultantForce > 0
+    ? (firstDataPoint.horizontalForce / firstDataPoint.resultantForce) * 100
+    : 0;
+  
+  // DRF: Decrease in RF per unit velocity
+  // DRF = (RF at v=0 - RF at v=V0) / V0
+  // Simplified: DRF ≈ -RFmax / V0
+  const DRF = V0 > 0 ? -RFmax / V0 : 0;
+  
+  // Calculate optimal profile
+  const optimal = calculateOptimalProfile(F0, V0, bodyMassKg);
+  const optimalPmax = (optimal.optimalF0 * optimal.optimalV0) / 4;
+  const mechanicalEffectiveness = (Pmax / optimalPmax) * 100;
+  
+  // Summary statistics
+  const avgForce = horizontalForces.reduce((sum, f) => sum + f, 0) / horizontalForces.length;
+  const avgPower = dataPoints.reduce((sum, p) => sum + p.power, 0) / dataPoints.length;
+  const peakVelocity = Math.max(...velocities);
+  const accelerations = dataPoints.map(p => p.acceleration);
+  const avgAcceleration = accelerations.reduce((sum, a) => sum + a, 0) / accelerations.length;
+  const peakAcceleration = Math.max(...accelerations);
+  const avgForceRatio = dataPoints.reduce((sum, p) => sum + p.forceRatio, 0) / dataPoints.length;
+  const totalDistance = splits[splits.length - 1].distance - splits[0].distance;
+  const totalTime = splits[splits.length - 1].time - splits[0].time;
+  
+  // Quality assessment
+  let dataQuality: 'excellent' | 'good' | 'fair' | 'poor' = 'good';
+  if (rSquared >= 0.95 && dataPoints.length >= 8) {
+    dataQuality = 'excellent';
+  } else if (rSquared >= 0.90 && dataPoints.length >= 5) {
+    dataQuality = 'good';
+  } else if (rSquared >= 0.80) {
+    dataQuality = 'fair';
+  } else {
+    dataQuality = 'poor';
+    warnings.push('Low R² value - data may not follow linear FV relationship');
+  }
+  
+  if (dataPoints.length < 5) {
+    warnings.push('Limited data points - results may be less accurate');
+  }
+  
+  if (totalDistance < 20) {
+    warnings.push('Short measurement distance - may not capture full acceleration phase');
+  }
+  
+  const result: HFVPResult = {
+    F0,
+    V0,
+    Pmax,
+    RFmax,
+    DRF,
+    FVSlope,
+    mechanicalEffectiveness,
+    dataPoints,
+    rSquared,
+    summary: {
+      avgForce,
+      avgPower,
+      peakVelocity,
+      avgAcceleration,
+      peakAcceleration,
+      avgForceRatio,
+      totalDistance,
+      totalTime,
+    },
+    quality: {
+      isValid: true,
+      warnings,
+      dataQuality,
+    },
+    measurementMode: 'panning',
+    isPanningHighQuality: dataPoints.length >= 8 && totalDistance >= 50,
+  };
+  
+  console.log(`✅ H-FVP calculation complete (Panning Mode)`);
+  console.log(`   F0: ${F0.toFixed(2)} N (${(F0/bodyMassKg).toFixed(2)} N/kg)`);
+  console.log(`   V0: ${V0.toFixed(2)} m/s`);
+  console.log(`   Pmax: ${Pmax.toFixed(2)} W (${(Pmax/bodyMassKg).toFixed(2)} W/kg)`);
+  console.log(`   RFmax: ${RFmax.toFixed(1)}%`);
+  console.log(`   DRF: ${DRF.toFixed(2)} %/(m/s)`);
+  console.log(`   Mechanical Effectiveness: ${mechanicalEffectiveness.toFixed(1)}%`);
+  console.log(`   Data Quality: ${dataQuality} (R²: ${rSquared.toFixed(3)})`);
+  
+  return result;
 }
