@@ -10,6 +10,7 @@ import "./App.css";
 import { supabase } from "./lib/supabaseClient";
 import Chart from "chart.js/auto";
 import { generateRunningEvaluation, type RunningEvaluation } from "./runningEvaluation";
+import OpenAI from "openai";
 // New multi-camera components
 import { MultiCameraSetup } from './components/MultiCameraSetup';
 import CanvasRoiSelector from './components/CanvasRoiSelector';
@@ -30,6 +31,73 @@ import MobileHeader from './components/MobileHeader';
 import MultiCameraAnalyzer from "./components/MultiCameraAnalyzer";
 import { parseMedia } from "@remotion/media-parser";
 import { calculateHFVP, calculateHFVPFromPanningSplits, type HFVPResult, type StepDataForHFVP, type PanningSplitDataForHFVP } from './utils/hfvpCalculator';
+import { computeHFVP, type HFVPResult as HFVPMixedResult } from './lib/hfvpMixed';
+// ===== 検定モード (Phase 4) =====
+import CertificationMode from './components/Certification/CertificationMode';
+
+// ===== H-FVP display helpers (ADD) =====
+type XY = { x: number; y: number };
+
+type RegressionResult = {
+  slope: number;
+  intercept: number;
+  r2: number;
+};
+
+const isFiniteNumber = (v: unknown): v is number =>
+  typeof v === "number" && Number.isFinite(v);
+
+const round = (v: number, d = 2): number => {
+  const p = 10 ** d;
+  return Math.round(v * p) / p;
+};
+
+const linearRegression = (points: XY[]): RegressionResult | null => {
+  if (!points || points.length < 2) return null;
+
+  const n = points.length;
+  const sx = points.reduce((s, p) => s + p.x, 0);
+  const sy = points.reduce((s, p) => s + p.y, 0);
+  const sxx = points.reduce((s, p) => s + p.x * p.x, 0);
+  const sxy = points.reduce((s, p) => s + p.x * p.y, 0);
+
+  const den = n * sxx - sx * sx;
+  if (Math.abs(den) < 1e-12) return null;
+
+  const slope = (n * sxy - sx * sy) / den;
+  const intercept = (sy - slope * sx) / n;
+
+  const yMean = sy / n;
+  let ssTot = 0;
+  let ssRes = 0;
+  for (const p of points) {
+    const yHat = slope * p.x + intercept;
+    ssTot += (p.y - yMean) ** 2;
+    ssRes += (p.y - yHat) ** 2;
+  }
+  const r2 = ssTot > 0 ? 1 - ssRes / ssTot : 1;
+
+  return { slope, intercept, r2 };
+};
+
+const r2FromActualPred = (actual: number[], pred: number[]): number | null => {
+  if (actual.length !== pred.length || actual.length < 2) return null;
+  const mean = actual.reduce((s, v) => s + v, 0) / actual.length;
+  let ssTot = 0;
+  let ssRes = 0;
+  for (let i = 0; i < actual.length; i++) {
+    ssTot += (actual[i] - mean) ** 2;
+    ssRes += (actual[i] - pred[i]) ** 2;
+  }
+  return ssTot > 0 ? 1 - ssRes / ssTot : 1;
+};
+
+const qualityLabel = (r2: number | null): "優" | "良" | "可" | "-" => {
+  if (r2 === null || !Number.isFinite(r2)) return "-";
+  if (r2 >= 0.99) return "優";
+  if (r2 >= 0.97) return "良";
+  return "可";
+};
 
 /** ウィザードのステップ */
 type WizardStep = 0 | 1 | 2 | 3 | 3.5 | 4 | 5 | 5.5 | 6 | 6.5 | 7 | 8 | 9;
@@ -576,6 +644,20 @@ const App: React.FC<AppProps> = ({ userProfile }) => {
     return () => window.removeEventListener('resize', checkDevice);
   }, []);
 
+// ===== 検定モード切り替え (Phase 4) =====
+  const [appMode, setAppMode] = useState<'normal' | 'certification'>('normal');
+  
+  // 検定モードで保存された情報
+  const [pendingCertification, setPendingCertification] = useState<{
+    sessionId: string;
+    attemptId: string;
+    gradeCode: string;
+    athleteName: string;
+    evaluatorName: string;
+    athleteId?: string; // 選手IDを追加
+    measurementCompleted?: boolean; // 測定完了フラグ
+  } | null>(null);
+
 const [wizardStep, setWizardStep] = useState<WizardStep>(0);
   const [selectedFps, setSelectedFps] = useState<number>(120); 
   const [analysisMode, setAnalysisMode] = useState<AnalysisMode>('single');
@@ -640,6 +722,9 @@ const [athleteInfo, setAthleteInfo] =
 const [athleteOptions, setAthleteOptions] = useState<AthleteOption[]>([]);
 const [selectedAthleteId, setSelectedAthleteId] = useState<string | null>(null);
 
+// ------------- ユーザー情報（検定用） -------------------
+const [currentUser, setCurrentUser] = useState<{ id: string; email: string | null } | null>(null);
+
 // ログイン中ユーザーの選手一覧を読み込む
 useEffect(() => {
   const loadAthletes = async () => {
@@ -660,6 +745,12 @@ useEffect(() => {
 
     const authUserId = sessionData.session.user.id;
     console.log('✅ ユーザーID:', authUserId);
+    
+    // ユーザー情報を保存（検定用）
+    setCurrentUser({
+      id: authUserId,
+      email: sessionData.session.user.email || null
+    });
 
     // 一時的に weight_kg を除外（カラムが存在しない場合のフォールバック）
     let { data, error } = await supabase
@@ -826,6 +917,26 @@ useEffect(() => {
   const [panningZoomLevel, setPanningZoomLevel] = useState<number>(1); // ズームレベル (1=100%, 2=200%, etc.)
   const [panningInputMode, setPanningInputMode] = useState<'video' | 'manual'>('video'); // 入力モード切り替え
   const [manualTimeInput, setManualTimeInput] = useState<string>(''); // 手動タイム入力
+  const [showPanningGuide, setShowPanningGuide] = useState<boolean>(false); // 使い方ガイド開閉
+  
+  // アコーディオン用のstate（初期状態: 全て閉じる）
+  const [accordionState, setAccordionState] = useState({
+    overview: false,             // 概要
+    intervals: false,            // 区間データ
+    hfvpAnalysis: false,         // H-FVP分析
+    goalAchievement: false,      // 目標達成
+    aiImprovements: false,       // AI改善提案
+    aiTrainingPlan: false,       // AIトレーニングプラン
+    poseAnalysis: false,         // 姿勢分析
+    splitsList: false            // スプリット一覧
+  });
+  
+  const toggleAccordion = (key: keyof typeof accordionState) => {
+    setAccordionState(prev => ({
+      ...prev,
+      [key]: !prev[key]
+    }));
+  };
   
   // ドラッグ用のstate
   const panningViewportRef = useRef<HTMLDivElement | null>(null);
@@ -2901,111 +3012,305 @@ const clearMarksByButton = () => {
     // 🔬 H-FVP計算（Horizontal Force-Velocity Profile）
     // 線形回帰により F0 (最大推進力) と V0 (理論最大速度) を推定
     // a = a0 - (a0/v0) × v の形で線形近似
+    // 新しい高精度計算: Huber回帰 + 外れ値除外 + 品質評価
     
     let hfvpData = null;
     
     if (athleteInfo.weight_kg > 0 && intervals.length >= 2) {
-      // 各区間の中間速度と加速度のデータポイントを収集
-      const velocities: number[] = [];
-      const accelerations: number[] = [];
-      
-      for (let i = 0; i < intervals.length; i++) {
-        const interval = intervals[i];
-        // 区間の中間速度を使用
-        const v_mid = (interval.v_start + interval.v_end) / 2;
-        velocities.push(v_mid);
-        accelerations.push(interval.acceleration);
-      }
-      
-      // 線形回帰: a = a0 - (a0/v0) * v
-      // 最小二乗法で a0 と v0 を推定
-      const n = velocities.length;
-      const sum_v = velocities.reduce((s, v) => s + v, 0);
-      const sum_a = accelerations.reduce((s, a) => s + a, 0);
-      const sum_vv = velocities.reduce((s, v) => s + v * v, 0);
-      const sum_va = velocities.reduce((s, v, i) => s + v * accelerations[i], 0);
-      
-      // 回帰係数の計算
-      const slope = (n * sum_va - sum_v * sum_a) / (n * sum_vv - sum_v * sum_v);
-      const intercept = (sum_a - slope * sum_v) / n;
-      
-      // a0 (v=0での加速度) と v0 (a=0での速度) を計算
-      const a0 = intercept;
-      const v0 = -intercept / slope; // a = a0 + slope*v = 0 → v = -a0/slope
-      
-      // F0 (最大推進力) = 体重 × a0
-      const F0 = athleteInfo.weight_kg * a0;
-      
-      // Pmax (最大パワー) = F0 × V0 / 4
-      const Pmax = F0 * v0 / 4;
-      
-      // 各地点でのH-FVP指標を計算
-      const hfvpPoints = intervalSplits.map((split, idx) => {
-        let v: number;
-        let a: number;
+      // 🆕 高精度H-FVP計算を使用
+      try {
+        const markerDistances = intervalSplits.map(s => s.distance);
+        const cumulativeTimes = intervalSplits.map(s => s.time);
         
-        if (idx === 0) {
-          // 開始地点（静止）
-          v = 0;
-          a = a0;
-        } else {
-          // 区間の終了時点での速度と加速度を使用
-          const interval = intervals[idx - 1];
-          v = interval.v_end;
-          a = interval.acceleration;
+        const hfvpResult = computeHFVP(
+          {
+            markerDistances,
+            cumulativeTimes,
+            massKg: athleteInfo.weight_kg
+          },
+          {
+            regression: 'huber',           // 外れ値耐性あり
+            firstSegmentModel: 'fromRest', // 静止スタート
+            removeOutliers: true,          // 外れ値除外
+            outlierSigma: 3.5              // 外れ値判定閾値
+          }
+        );
+        
+        // 既存フォーマットに変換
+        const F0 = hfvpResult.summary.f0N;
+        const v0 = hfvpResult.summary.v0;
+        const Pmax = hfvpResult.summary.pmaxW;
+        const a0 = hfvpResult.summary.f0RelNkg;
+        const DRF = hfvpResult.summary.drf;
+        const RF_max = hfvpResult.summary.rfMax;
+        
+        // 各地点のH-FVP指標（既存フォーマット）
+        const hfvpPoints = hfvpResult.segments.map((seg, idx) => ({
+          distance: seg.endDistance,
+          time: seg.cumulativeTime,
+          velocity: seg.speed,
+          acceleration: seg.acceleration,
+          force: seg.forceN,
+          power: seg.powerW,
+          rf: seg.rfPercent
+        }));
+        
+        // スタート地点(0m)を追加
+        hfvpPoints.unshift({
+          distance: 0,
+          time: 0,
+          velocity: 0,
+          acceleration: a0,
+          force: F0,
+          power: 0,
+          rf: 100
+        });
+        
+        console.log('✅ 高精度H-FVP計算完了:', {
+          '品質評価': hfvpResult.quality.grade,
+          'F-v回帰 R²': hfvpResult.summary.fvR2,
+          '使用点数': `${hfvpResult.summary.usedPoints}/${hfvpResult.summary.totalPoints}`,
+          '警告': hfvpResult.quality.warnings.length > 0 
+            ? hfvpResult.quality.warnings.join('; ') 
+            : 'なし'
+        });
+        
+        if (hfvpResult.quality.warnings.length > 0) {
+          console.warn('⚠️ H-FVP品質警告:', hfvpResult.quality.warnings);
+        }
+      
+      // 🎯 AI改善提案の生成
+      const generateImprovementGoals = () => {
+        const goals = [];
+        
+        // 体重別の標準値（アスリートレベル）
+        const weight = athleteInfo.weight_kg;
+        
+        // F0の評価と目標
+        const F0_target = weight * 4.5; // 理想値: 体重×4.5 N/kg
+        const F0_excellent = weight * 5.5; // 優秀: 体重×5.5 N/kg
+        const F0_percent = (F0 / F0_target) * 100;
+        
+        if (F0 < F0_target) {
+          goals.push({
+            category: '筋力・爆発力',
+            current: F0.toFixed(1) + ' N',
+            target: F0_target.toFixed(1) + ' N',
+            excellent: F0_excellent.toFixed(1) + ' N',
+            improvement: ((F0_target - F0) / F0 * 100).toFixed(1) + '%',
+            level: F0_percent < 70 ? '初級' : F0_percent < 90 ? '中級' : '上級',
+            recommendation: 'ウェイトトレーニング（スクワット、デッドリフト）を週3回。プライオメトリクス（ジャンプ系）も追加。'
+          });
         }
         
-        // F (推進力) = 体重 × a
-        const F = athleteInfo.weight_kg * a;
+        // V0の評価と目標
+        const V0_target = 11.0; // 理想値: 11.0 m/s
+        const V0_excellent = 12.0; // 優秀: 12.0 m/s
+        const V0_percent = (v0 / V0_target) * 100;
         
-        // P (パワー) = F × v
-        const P = F * v;
+        if (v0 < V0_target) {
+          goals.push({
+            category: 'V0（理論最大速度）',
+            current: v0.toFixed(2) + ' m/s',
+            target: V0_target.toFixed(2) + ' m/s',
+            excellent: V0_excellent.toFixed(2) + ' m/s',
+            improvement: ((V0_target - v0) / v0 * 100).toFixed(1) + '%',
+            level: V0_percent < 70 ? '初級' : V0_percent < 90 ? '中級' : '上級',
+            recommendation: '※V0は理論値です。最大速度走（30-40m）を週2回実施。フライングスタートや風抵抗走も効果的。'
+          });
+        }
         
-        // DRF (Decrease in Ratio of Force) = F / F0 × 100
-        const DRF = (F / F0) * 100;
+        // Pmaxの評価と目標
+        const Pmax_target = weight * 15; // 理想値: 体重×15 W/kg
+        const Pmax_excellent = weight * 20; // 優秀: 体重×20 W/kg
+        const Pmax_percent = (Pmax / Pmax_target) * 100;
+        
+        if (Pmax < Pmax_target) {
+          goals.push({
+            category: 'パワー出力',
+            current: Pmax.toFixed(0) + ' W',
+            target: Pmax_target.toFixed(0) + ' W',
+            excellent: Pmax_excellent.toFixed(0) + ' W',
+            improvement: ((Pmax_target - Pmax) / Pmax * 100).toFixed(1) + '%',
+            level: Pmax_percent < 70 ? '初級' : Pmax_percent < 90 ? '中級' : '上級',
+            recommendation: 'パワークリーン、メディシンボール投げ。加速ダッシュ（0-30m）を週2-3回。'
+          });
+        }
+        
+        // 0-10m加速度の評価
+        const first_interval = intervals[0];
+        const a_10m_target = 4.0; // 理想値: 4.0 m/s²
+        const a_10m_excellent = 5.0; // 優秀: 5.0 m/s²
+        
+        if (first_interval && first_interval.acceleration < a_10m_target) {
+          goals.push({
+            category: '初期加速（0-10m）',
+            current: first_interval.acceleration.toFixed(2) + ' m/s²',
+            target: a_10m_target.toFixed(2) + ' m/s²',
+            excellent: a_10m_excellent.toFixed(2) + ' m/s²',
+            improvement: ((a_10m_target - first_interval.acceleration) / first_interval.acceleration * 100).toFixed(1) + '%',
+            level: (first_interval.acceleration / a_10m_target * 100) < 70 ? '初級' : (first_interval.acceleration / a_10m_target * 100) < 90 ? '中級' : '上級',
+            recommendation: 'スタート練習（クラウチングスタート）。ヒルスプリント（坂道ダッシュ）で前傾姿勢を強化。'
+          });
+        }
+        
+        // 全体評価
+        const overall_score = (F0_percent + V0_percent + Pmax_percent) / 3;
         
         return {
-          distance: split.distance,
-          time: split.time,
-          velocity: v,
-          acceleration: a,
-          force: F,
-          power: P,
-          drf: DRF
+          goals,
+          overall_score: overall_score.toFixed(1),
+          overall_level: overall_score < 70 ? '初級' : overall_score < 85 ? '中級' : overall_score < 95 ? '上級' : 'エリート',
+          summary: overall_score >= 95 
+            ? '素晴らしいパフォーマンスです！現状維持と微調整に集中しましょう。' 
+            : overall_score >= 85 
+            ? '良好なパフォーマンスです。特定の弱点を集中的に改善しましょう。'
+            : overall_score >= 70
+            ? '基礎的な力は備わっています。バランスよくトレーニングを継続しましょう。'
+            : '基礎体力と技術の向上が必要です。段階的にトレーニングを積み重ねましょう。'
         };
-      });
-      
-      hfvpData = {
-        F0,      // 最大推進力 (N)
-        v0,      // 理論最大速度 (m/s)
-        Pmax,    // 最大パワー (W)
-        a0,      // 初期加速度 (m/s²)
-        points: hfvpPoints
       };
       
-      // デバッグログ
-      console.log('🔬 H-FVP Analysis:', {
-        'F0 (最大推進力)': F0.toFixed(2) + ' N',
-        'V0 (理論最大速度)': v0.toFixed(2) + ' m/s',
-        'Pmax (最大パワー)': Pmax.toFixed(2) + ' W',
-        'a0 (初期加速度)': a0.toFixed(2) + ' m/s²',
-        '回帰式': `a = ${a0.toFixed(2)} - ${(a0/v0).toFixed(2)} × v`,
-        '決定係数 R²': 'TODO' // 必要に応じて追加
-      });
-      
-      console.log('📊 H-FVP Points (各地点):');
-      hfvpPoints.forEach((point, idx) => {
-        console.log(`  ${point.distance.toFixed(0)}m:`, {
-          '速度 v': point.velocity.toFixed(2) + ' m/s',
-          '力 F': point.force.toFixed(0) + ' N',
-          'パワー P': point.power.toFixed(0) + ' W',
-          'DRF': point.drf.toFixed(1) + ' %'
+        const improvementGoals = generateImprovementGoals();
+        
+        hfvpData = {
+          F0,      // 最大推進力 (N)
+          v0,      // 理論最大速度 (m/s)
+          Pmax,    // 最大パワー (W)
+          a0,      // 初期加速度 (m/s²)
+          DRF,     // RF低下率 (%/(m/s))
+          RF_max,  // 理論最大RF (%)
+          points: hfvpPoints,
+          improvementGoals,
+          quality: hfvpResult.quality,
+          summary: hfvpResult.summary, // usedSections / excludedSections / posR2 を含む
+        };
+        
+        // デバッグログ
+        console.log('🔬 H-FVP Analysis:', {
+          'F0 (最大推進力)': F0.toFixed(2) + ' N',
+          'V0 (理論最大速度)': v0.toFixed(2) + ' m/s',
+          'Pmax (最大パワー)': Pmax.toFixed(2) + ' W',
+          'a0 (初期加速度)': a0.toFixed(2) + ' m/s²',
+          'DRF (RF低下率)': DRF.toFixed(2) + ' %/(m/s)',
+          'RF_max (理論最大RF)': RF_max.toFixed(1) + ' %',
+          '回帰式 (加速度)': `a = ${a0.toFixed(2)} - ${(a0/v0).toFixed(2)} × v`,
+          '回帰式 (RF)': `RF = ${RF_max.toFixed(1)} + ${DRF.toFixed(2)} × v`,
+          '品質評価': hfvpResult.quality.grade,
+          'F-v回帰 R²': hfvpResult.summary.fvR2
         });
-      });
+        
+        console.log('📊 H-FVP Points (各地点):');
+        hfvpPoints.forEach((point, idx) => {
+          console.log(`  ${point.distance.toFixed(0)}m:`, {
+            '速度 v': point.velocity.toFixed(2) + ' m/s',
+            '力 F': point.force.toFixed(0) + ' N',
+            'パワー P': point.power.toFixed(0) + ' W',
+            'RF (力比率)': point.rf.toFixed(1) + ' %'
+          });
+        });
+      } catch (error) {
+        console.error('❌ H-FVP計算エラー:', error);
+        // エラー時は従来の計算を使用するか、nullにする
+        hfvpData = null;
+      }
     }
     
-    // 100m推定タイム（最大速度を維持すると仮定）
-    const estimated100mTime = totalTime + (100 - totalDistance) / maxSpeed;
+    // 🎯 100m推定タイム（AIベースの高精度予測）
+    // 
+    // 方法: 速度-距離の関係をモデル化し、50m以降の速度を予測
+    // 
+    // アプローチ:
+    // 1. 0-50mの速度変化パターンから加速度の減衰率を計算
+    // 2. 50-100mでは加速度がさらに低下し、最終的に減速
+    // 3. 各10m区間の予測タイムを積算
+    
+    let estimated100mTime = totalTime;
+    
+    if (totalDistance >= 40 && intervals.length >= 4) {
+      // 加速度の変化パターンを分析
+      const accelerations = intervals.map(i => i.acceleration);
+      
+      // 最後の2区間の加速度（減速傾向を確認）
+      const lastAccel = accelerations[accelerations.length - 1];
+      const secondLastAccel = accelerations[accelerations.length - 2];
+      
+      // 加速度の変化率（減衰率）
+      const accelDecayRate = secondLastAccel > 0 
+        ? (lastAccel - secondLastAccel) / secondLastAccel 
+        : -0.2; // デフォルト: -20%
+      
+      // 最後の区間の終了速度（50m地点）
+      const v50 = intervals[intervals.length - 1].v_end;
+      
+      // 50-100mの各10m区間を予測
+      let currentVelocity = v50;
+      let currentTime = totalTime;
+      let predictedAccel = lastAccel;
+      
+      console.log('🔮 100m予測計算:', {
+        '50m地点の速度': v50.toFixed(2) + ' m/s',
+        '最終区間の加速度': lastAccel.toFixed(3) + ' m/s²',
+        '加速度減衰率': (accelDecayRate * 100).toFixed(1) + '%',
+      });
+      
+      // 50-100mの各10m区間をシミュレーション
+      for (let dist = 50; dist < 100; dist += 10) {
+        // 加速度を減衰させる（減速方向へ）
+        predictedAccel = predictedAccel * (1 + accelDecayRate * 0.8);
+        
+        // 速度の減衰も考慮（トップスピード以降は維持または減速）
+        if (predictedAccel < 0) {
+          // 減速している場合
+          predictedAccel = Math.max(predictedAccel, -0.5); // 最大減速を制限
+        } else if (predictedAccel > 0 && predictedAccel < 0.2) {
+          // ほぼ速度維持
+          predictedAccel = 0.1;
+        }
+        
+        // 次の10m区間の平均速度を計算
+        // v_avg = (v_start + v_end) / 2
+        // v_end = v_start + a × t
+        // distance = v_avg × t = v_start × t + 0.5 × a × t²
+        // 10 = v_start × t + 0.5 × a × t²
+        
+        // 簡易計算: t = distance / v_avg（等加速度運動の近似）
+        const nextVelocity = currentVelocity + predictedAccel * (10 / currentVelocity);
+        const avgVelocityInInterval = (currentVelocity + nextVelocity) / 2;
+        const timeForInterval = 10 / avgVelocityInInterval;
+        
+        console.log(`  ${dist}-${dist+10}m:`, {
+          '開始速度': currentVelocity.toFixed(2) + ' m/s',
+          '終了速度': nextVelocity.toFixed(2) + ' m/s',
+          '加速度': predictedAccel.toFixed(3) + ' m/s²',
+          '区間タイム': timeForInterval.toFixed(3) + 's'
+        });
+        
+        currentTime += timeForInterval;
+        currentVelocity = nextVelocity;
+      }
+      
+      estimated100mTime = currentTime;
+      
+      console.log('🏁 100m予測結果:', {
+        '50mタイム': totalTime.toFixed(3) + 's',
+        '100m予測タイム': estimated100mTime.toFixed(3) + 's',
+        '50-100m区間': (estimated100mTime - totalTime).toFixed(3) + 's',
+        '100m地点の予測速度': currentVelocity.toFixed(2) + ' m/s'
+      });
+      
+    } else {
+      // データ不足の場合は、最大速度の90%を維持すると仮定
+      const remainingDistance = 100 - totalDistance;
+      const estimatedSpeedFor50_100m = maxSpeed * 0.9;
+      estimated100mTime = totalTime + remainingDistance / estimatedSpeedFor50_100m;
+      
+      console.log('⚠️ データ不足: 簡易推定を使用', {
+        '残り距離': remainingDistance.toFixed(1) + 'm',
+        '推定速度': estimatedSpeedFor50_100m.toFixed(2) + ' m/s',
+        '100m予測タイム': estimated100mTime.toFixed(3) + 's'
+      });
+    }
     
     console.log(`📊 Panning Sprint Analysis:`, {
       totalDistance,
@@ -3027,7 +3332,452 @@ const clearMarksByButton = () => {
       estimated100mTime,
       hfvpData // H-FVPデータを追加
     };
-  }, [analysisMode, panningSplits, panningStartIndex, panningEndIndex]);
+  }, [analysisMode, panningSplits, panningStartIndex, panningEndIndex, athleteInfo.weight_kg]);
+
+  // ===== 検定モード：測定完了時に自動的に戻る =====
+  useEffect(() => {
+    // 検定待ちの状態で、パンニング分析が完了したら自動的に検定モードに戻る
+    if (pendingCertification && panningSprintAnalysis && appMode === 'normal' && !pendingCertification.measurementCompleted) {
+      console.log('✅ 測定完了！検定モードに自動的に戻ります', panningSprintAnalysis);
+      
+      // ユーザーに通知
+      alert('✅ 測定完了！\n\n検定モードに戻って採点結果を確認します。');
+      
+      // 測定完了フラグを立てる（pendingCertificationは保持）
+      setPendingCertification({
+        ...pendingCertification,
+        measurementCompleted: true
+      });
+      
+      // 検定モードに戻る
+      setAppMode('certification');
+    }
+  }, [panningSprintAnalysis, pendingCertification, appMode]);
+
+  // ===== 検定モード：選手情報を自動入力 =====
+  useEffect(() => {
+    if (pendingCertification?.athleteId && appMode === 'normal') {
+      const selectedAthlete = athleteOptions.find(
+        (ath) => ath.id === pendingCertification.athleteId
+      );
+      if (selectedAthlete) {
+        console.log('[App] Auto-filling athlete info from pending certification:', selectedAthlete);
+        setAthleteInfo({
+          name: selectedAthlete.full_name ?? "",
+          age: selectedAthlete.age ?? null,
+          gender:
+            (selectedAthlete.gender as
+              | "male"
+              | "female"
+              | "other"
+              | null) ?? null,
+          affiliation: selectedAthlete.affiliation ?? "",
+          height_cm: selectedAthlete.height_cm ?? null,
+          weight_kg: selectedAthlete.weight_kg ?? null,
+          current_record:
+            selectedAthlete.current_record_s != null
+              ? String(selectedAthlete.current_record_s)
+              : "",
+          target_record:
+            selectedAthlete.target_record_s != null
+              ? String(selectedAthlete.target_record_s)
+              : "",
+        });
+      }
+    }
+  }, [pendingCertification, appMode, athleteOptions]);
+
+  // ===== H-FVP dashboard values (ADD) =====
+  const hfvpDashboard = useMemo(() => {
+    // --- 既存変数名に合わせて置換 ---
+    // 1) 体重(kg)
+    const massKg = athleteInfo.weight_kg ?? 60;
+    
+    // 2) 既存H-FVPカード値（絶対値）
+    const hfvpData = panningSprintAnalysis?.hfvpData;
+    if (!hfvpData) return null;
+    
+    const F0 = hfvpData.F0 ?? 0;   // N
+    const V0 = hfvpData.v0 ?? 0;   // m/s
+    const Pmax = hfvpData.Pmax ?? 0; // W
+    
+    // 3) 既存の「各地点(区間代表値)」配列
+    const rows = hfvpData.points ?? [];
+    
+    // 4) 10mスプリット配列（位置フィットR²用）
+    const intervals = panningSprintAnalysis?.intervals ?? [];
+    const splitTimes = intervals.map(int => int.time); // 各区間のタイム
+    const segmentDistance = 10;
+    // --- ここまで ---
+
+    if (!isFiniteNumber(massKg) || massKg <= 0) return null;
+    if (F0 <= 0 || V0 <= 0) return null;
+
+    // 相対値
+    const f0Rel = F0 / massKg;      // N/kg
+    const pmaxRel = Pmax / massKg;  // W/kg
+
+    // Vmax（実測最大）
+    const vmax = rows.length ? Math.max(...rows.map((r) => r.velocity || 0)) : 0;
+
+    // RF点: 既存定義を維持して F/F0*100（0m除外）
+    const rfPoints = rows
+      .filter((r) => r.velocity > 0 && isFiniteNumber(r.force) && F0 > 0)
+      .map((r) => ({ x: r.velocity, y: (r.force / F0) * 100 }));
+
+    const rfReg = linearRegression(rfPoints);
+    const rfmax = rfReg ? rfReg.intercept : null; // %
+    const drf = rfReg ? rfReg.slope : null;       // %/(m/s), 通常は負
+
+    // F-v 回帰R²（品質）
+    const fvPoints = rows
+      .filter((r) => isFiniteNumber(r.velocity) && isFiniteNumber(r.force))
+      .map((r) => ({ x: r.velocity, y: r.force }));
+    const fvReg = linearRegression(fvPoints);
+
+    // τ（単純モデル）: tau = m*V0/F0 = V0/(F0/m)
+    const tau = F0 > 0 ? (massKg * V0) / F0 : null;
+
+    // 位置フィットR²: x(t)=V0*(t - tau*(1-exp(-t/tau)))
+    let posR2: number | null = null;
+    if (tau && tau > 0 && splitTimes.length >= 2) {
+      const tCum: number[] = [];
+      let t = 0;
+      for (const dt of splitTimes) {
+        t += dt;
+        tCum.push(t);
+      }
+      const xActual = tCum.map((_, i) => (i + 1) * segmentDistance);
+      const xPred = tCum.map((tc) => V0 * (tc - tau * (1 - Math.exp(-tc / tau))));
+      posR2 = r2FromActualPred(xActual, xPred);
+    }
+
+    return {
+      f0Rel: round(f0Rel, 2),
+      v0: round(V0, 2),
+      pmaxRel: round(pmaxRel, 2),
+      rfmax: rfmax !== null ? round(Math.max(0, Math.min(100, rfmax)), 1) : null,
+      drf: drf !== null ? round(drf, 2) : null,
+      vmax: round(vmax, 2),
+      tau: tau !== null ? round(tau, 2) : null,
+      fvR2: fvReg ? round(fvReg.r2, 3) : null,
+      posR2: posR2 !== null ? round(posR2, 3) : null,
+      fvQuality: qualityLabel(fvReg ? fvReg.r2 : null),
+      posQuality: qualityLabel(posR2),
+    };
+  }, [athleteInfo.weight_kg, panningSprintAnalysis]);
+
+  // ===== 目標達成カード計算 (ADD) =====
+  const goalAchievement = useMemo(() => {
+    if (!panningSprintAnalysis || !hfvpDashboard) return null;
+    
+    const currentTime = panningSprintAnalysis.totalTime;
+    const currentDistance = panningSprintAnalysis.totalDistance;
+    const estimated100mTime = panningSprintAnalysis.estimated100mTime || currentTime;
+    
+    // 目標タイムをパース（例: "10.5s" or "10.5" or "10秒50"）
+    const targetRecordStr = athleteInfo.target_record?.trim() || '';
+    if (!targetRecordStr) return null;
+    
+    let goalTime: number | null = null;
+    
+    // パターン1: "10.5" (数値のみ)
+    const numMatch = targetRecordStr.match(/^(\d+(?:\.\d+)?)$/);
+    if (numMatch) {
+      goalTime = parseFloat(numMatch[1]);
+    }
+    
+    // パターン2: "10.5s" or "10.5秒"
+    const timeMatch = targetRecordStr.match(/(\d+(?:\.\d+)?)\s*[s秒]/i);
+    if (timeMatch) {
+      goalTime = parseFloat(timeMatch[1]);
+    }
+    
+    // パターン3: "10秒50" or "10'50"
+    const minSecMatch = targetRecordStr.match(/(\d+)\s*[秒']['""]?\s*(\d+)/);
+    if (minSecMatch) {
+      goalTime = parseInt(minSecMatch[1]) + parseInt(minSecMatch[2]) / 100;
+    }
+    
+    if (!goalTime || !isFiniteNumber(goalTime) || goalTime <= 0) return null;
+    
+    // 50mタイムと100m予測タイムを取得
+    let scaled50mTime = currentTime;
+    
+    console.log('🎯 目標達成計算（100m基準）:', {
+      '測定距離': currentDistance.toFixed(2) + 'm',
+      '50mタイム': currentTime.toFixed(3) + 's',
+      '100m予測タイム': estimated100mTime.toFixed(3) + 's',
+      '目標タイム（100m）': goalTime + 's'
+    });
+    
+    // 目標は100mタイムなので、100m予測タイムと比較
+    const gap = estimated100mTime - goalTime;
+    
+    // 達成度（%）- 100m予測タイムで評価
+    const achievement = goalTime > 0 ? Math.min(100, (goalTime / estimated100mTime) * 100) : 0;
+    
+    console.log('📊 目標達成結果（100m基準）:', {
+      '100m予測タイム': estimated100mTime.toFixed(2) + 's',
+      '目標タイム': goalTime + 's',
+      '差分': gap.toFixed(3) + 's',
+      '達成度': achievement.toFixed(1) + '%',
+      '達成': gap <= 0 ? '✅' : '❌'
+    });
+    
+    // 改善提案
+    const suggestions: string[] = [];
+    
+    if (gap > 0) {
+      // 遅い場合の改善提案
+      
+      // V0改善による効果推定
+      const currentV0 = hfvpDashboard.v0;
+      const currentF0Rel = hfvpDashboard.f0Rel;
+      
+      // 100m基準での速度向上計算
+      const current100mAvgSpeed = 100 / estimated100mTime;
+      const needed100mAvgSpeed = 100 / goalTime;
+      const speedGap = needed100mAvgSpeed - current100mAvgSpeed;
+      
+      console.log('💡 改善提案計算（100m基準）:', {
+        '現在の100m平均速度': current100mAvgSpeed.toFixed(2) + ' m/s',
+        '必要な100m平均速度': needed100mAvgSpeed.toFixed(2) + ' m/s',
+        '速度差': speedGap.toFixed(2) + ' m/s'
+      });
+      
+      if (speedGap > 0.2) {
+        const v0Improvement = speedGap * 1.2; // V0は平均速度より高い
+        suggestions.push(`V0を${v0Improvement.toFixed(2)} m/s向上させる（目標: ${(currentV0 + v0Improvement).toFixed(2)} m/s）`);
+      }
+      
+      // F0改善提案（100m基準の差分で調整）
+      if (currentF0Rel < 4.5) {
+        const f0ImprovementPercent = Math.min(15, (gap / goalTime) * 100);
+        suggestions.push(`F0を${f0ImprovementPercent.toFixed(0)}%向上させる（筋力トレーニング）`);
+      }
+      
+      // DRF改善提案
+      const drf = hfvpDashboard.drf;
+      if (drf !== null && drf < -8) {
+        suggestions.push('トップスピード維持トレーニング（DRFが急すぎる）');
+      } else if (drf !== null && drf > -6) {
+        suggestions.push('スタートダッシュ強化（DRFが緩すぎる）');
+      }
+      
+      // 技術改善
+      suggestions.push('スプリント技術の改善（ストライド頻度・接地時間）');
+    } else {
+      // 既に目標達成
+      suggestions.push('🎉 目標達成おめでとうございます！');
+      suggestions.push('さらなる記録更新を目指しましょう');
+    }
+    
+    return {
+      goalTime: round(goalTime, 2),
+      currentTime: round(scaled50mTime, 2), // 50m実測タイム
+      estimated100mTime: round(estimated100mTime, 2), // 100m予測タイム
+      gap: round(gap, 3),
+      achievement: round(achievement, 1),
+      isAchieved: gap <= 0,
+      suggestions
+    };
+  }, [panningSprintAnalysis, hfvpDashboard, athleteInfo.target_record]);
+
+  // ===== AI Training Plan State (ADD) =====
+  const [aiTrainingPlan, setAiTrainingPlan] = useState<string | null>(null);
+  const [isGeneratingPlan, setIsGeneratingPlan] = useState(false);
+  const [planError, setPlanError] = useState<string | null>(null);
+
+  // ===== Generate AI Training Plan (ADD) =====
+  const generateAITrainingPlan = useCallback(async () => {
+    if (!hfvpDashboard || !goalAchievement || !panningSprintAnalysis) {
+      alert('H-FVPデータと目標達成データが必要です');
+      return;
+    }
+
+    setIsGeneratingPlan(true);
+    setPlanError(null);
+
+    try {
+      // APIキーのチェック
+      const apiKey = import.meta.env.VITE_OPENAI_API_KEY || '';
+      const baseURL = import.meta.env.VITE_OPENAI_BASE_URL || 'https://www.genspark.ai/api/llm_proxy/v1';
+      
+      if (!apiKey) {
+        throw new Error('OpenAI APIキーが設定されていません。環境変数 VITE_OPENAI_API_KEY を設定してください。');
+      }
+      
+      console.log('🔑 Using API:', {
+        baseURL,
+        hasKey: !!apiKey
+      });
+      
+      // OpenAI client initialization
+      const client = new OpenAI({
+        apiKey,
+        baseURL,
+        dangerouslyAllowBrowser: true
+      });
+
+      // Prepare athlete profile
+      const athleteProfile = {
+        name: athleteInfo.name || '選手',
+        age: athleteInfo.age || 'N/A',
+        gender: athleteInfo.gender || 'N/A',
+        weight_kg: athleteInfo.weight_kg || 'N/A',
+        height_cm: athleteInfo.height_cm || 'N/A',
+        current_record: athleteInfo.current_record || 'N/A',
+        target_record: athleteInfo.target_record || 'N/A'
+      };
+
+      // Prepare H-FVP metrics
+      const hfvpMetrics = {
+        F0_relative: hfvpDashboard.f0Rel,
+        V0: hfvpDashboard.v0,
+        Pmax_relative: hfvpDashboard.pmaxRel,
+        RFmax: hfvpDashboard.rfmax,
+        DRF: hfvpDashboard.drf,
+        Vmax: hfvpDashboard.vmax,
+        tau: hfvpDashboard.tau,
+        fvR2: hfvpDashboard.fvR2,
+        posR2: hfvpDashboard.posR2,
+        dataQuality: `F-v: ${hfvpDashboard.fvQuality}, Position: ${hfvpDashboard.posQuality}`
+      };
+
+      // Prepare goal achievement data
+      const goalData = {
+        goalTime: goalAchievement.goalTime,
+        currentTime: goalAchievement.currentTime,
+        gap: goalAchievement.gap,
+        achievement: goalAchievement.achievement,
+        isAchieved: goalAchievement.isAchieved
+      };
+
+      // System prompt
+      const systemPrompt = `あなたは世界トップレベルのスプリントコーチであり、スポーツ科学の専門家です。
+H-FVP（Horizontal Force-Velocity Profile）分析に基づいた個別最適化トレーニングプログラムを作成します。
+
+以下の原則に従ってください：
+1. 科学的根拠（論文・研究）に基づいた提案
+2. 選手の現在の能力（H-FVP指標）を考慮
+3. 目標達成までの具体的な期間別トレーニング
+4. 実践可能な具体的メニュー（セット数・レップ数・負荷）
+5. 各トレーニングの目的と科学的根拠の説明
+
+H-FVP指標の解釈：
+- F0（相対）: 最大推進力/体重。高い=パワー型、低い=スピード型
+- V0: 理論最大速度。高い=トップスピード型
+- Pmax（相対）: 最大パワー/体重。総合的なスプリント能力
+- RFmax: 理論最大RF。力の維持能力
+- DRF: RF低下率。-6～-10が理想。<-10はスタート特化、>-6はスピード特化
+- Vmax: 実測最大速度
+- τ: 時定数。小さい=素早い加速`;
+
+      // User prompt
+      const userPrompt = `以下の選手の個別最適化トレーニングプランを作成してください。
+
+【選手プロフィール】
+${Object.entries(athleteProfile).map(([key, value]) => `- ${key}: ${value}`).join('\n')}
+
+【H-FVP分析結果】
+${Object.entries(hfvpMetrics).map(([key, value]) => `- ${key}: ${value}`).join('\n')}
+
+【目標達成状況】
+- 目標タイム: ${goalData.goalTime}秒
+- 現在タイム: ${goalData.currentTime}秒
+- 不足分: ${goalData.gap}秒
+- 達成度: ${goalData.achievement}%
+- 状態: ${goalData.isAchieved ? '✅ 達成済み' : '⏳ 未達成'}
+
+【スプリント区間データ】
+${panningSprintAnalysis.intervals.map((int, idx) => 
+  `${int.startDistance.toFixed(0)}-${int.endDistance.toFixed(0)}m: 速度${int.speed.toFixed(2)}m/s, 加速度${int.acceleration.toFixed(2)}m/s²`
+).join('\n')}
+
+以下の形式で出力してください：
+
+## 🎯 総合評価と課題
+
+## 📋 期間別トレーニングプラン（8週間）
+
+### Week 1-2: [フェーズ名]
+**目的**: 
+**科学的根拠**: 
+**トレーニングメニュー**:
+1. [種目名]
+   - セット数: 
+   - レップ数/距離: 
+   - 負荷/強度: 
+   - 回復時間: 
+   - 週頻度: 
+
+### Week 3-4: [フェーズ名]
+...
+
+### Week 5-6: [フェーズ名]
+...
+
+### Week 7-8: [フェーズ名]
+...
+
+## 💡 重要なポイント
+
+## 📊 進捗確認指標
+
+## ⚠️ 注意事項`;
+
+      console.log('🤖 AI Training Plan Generation Started...');
+      console.log('Athlete Profile:', athleteProfile);
+      console.log('H-FVP Metrics:', hfvpMetrics);
+      console.log('Goal Data:', goalData);
+
+      const completion = await client.chat.completions.create({
+        model: 'gpt-5',
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userPrompt }
+        ],
+        temperature: 0.7,
+        max_tokens: 3000
+      });
+
+      const plan = completion.choices[0]?.message?.content || '';
+      
+      if (!plan) {
+        throw new Error('AIからの応答が空でした');
+      }
+
+      setAiTrainingPlan(plan);
+      console.log('✅ AI Training Plan Generated Successfully');
+
+    } catch (error) {
+      console.error('❌ AI Training Plan Generation Error:', error);
+      let errorMessage = '不明なエラー';
+      
+      if (error instanceof Error) {
+        errorMessage = error.message;
+        
+        // 接続エラーの場合
+        if (errorMessage.includes('Connection error') || errorMessage.includes('Failed to fetch')) {
+          errorMessage = 'APIサーバーへの接続に失敗しました。ネットワーク接続を確認してください。';
+        }
+        // APIキーエラーの場合
+        else if (errorMessage.includes('APIキー') || errorMessage.includes('401') || errorMessage.includes('authentication')) {
+          errorMessage = 'APIキーの認証に失敗しました。管理者にお問い合わせください。';
+        }
+        // タイムアウトの場合
+        else if (errorMessage.includes('timeout')) {
+          errorMessage = 'リクエストがタイムアウトしました。もう一度お試しください。';
+        }
+      }
+      
+      setPlanError(errorMessage);
+      alert(`AIトレーニングプラン生成に失敗しました:\n${errorMessage}`);
+    } finally {
+      setIsGeneratingPlan(false);
+    }
+  }, [hfvpDashboard, goalAchievement, panningSprintAnalysis, athleteInfo]);
 
   // 🔬 H-FVP計算（水平力-速度プロファイル）
   const hfvpAnalysis = useMemo(() => {
@@ -3985,7 +4735,7 @@ const clearMarksByButton = () => {
     }
 
     ctx.strokeStyle = "#00ff00";  // より見やすい緑色
-    ctx.lineWidth = 10;  // 4 → 10に変更（さらに太く）
+    ctx.lineWidth = 5;  // スティックピクチャーの線の太さ
 
     const connections: [number, number][] = [
       [11, 12],
@@ -4730,8 +5480,37 @@ const handleExtractFrames = async (opts: ExtractFramesOpts = {}) => {
               correctedWidth = 1920;
               correctedHeight = 1080;
             } else {
-              // 本当の4K動画
+              // 本当の4K動画 → ユーザーに確認ダイアログを表示
               console.log(`✅ ファイルサイズ ${fileSizeMB.toFixed(0)}MB から判定: 真の4K動画`);
+              
+              // 🎯 4K動画の自動HDスケール設定（確認ダイアログ）
+              const use4K = window.confirm(
+                `4K動画が検出されました（3840×2160）\n` +
+                `ファイルサイズ: ${fileSizeMB.toFixed(1)}MB\n\n` +
+                `推奨: 処理速度とメモリ使用量を考慮し、HD（1920×1080）にスケールして読み込みます。\n\n` +
+                `【OK】: HD（1920×1080）で読み込む（推奨・高速）\n` +
+                `【キャンセル】: 4K（3840×2160）で読み込む（低速・大容量メモリ使用）\n\n` +
+                `HD（1920×1080）で読み込みますか？`
+              );
+              
+              if (use4K) {
+                // ユーザーが「OK」を選択 → HDにスケール
+                console.log(`✅ ユーザー選択: HD（1920×1080）にスケールして読み込み`);
+                correctedWidth = 1920;
+                correctedHeight = 1080;
+                alert(`HD（1920×1080）で読み込みます。\n処理が高速化され、メモリ使用量も削減されます。`);
+              } else {
+                // ユーザーが「キャンセル」を選択 → 4Kのまま
+                console.log(`⚠️ ユーザー選択: 4K（3840×2160）で読み込み（低速・大容量）`);
+                alert(
+                  `4K（3840×2160）で読み込みます。\n\n` +
+                  `注意:\n` +
+                  `- 処理時間が長くなります（2-3倍）\n` +
+                  `- メモリ使用量が大幅に増加します（4倍）\n` +
+                  `- ブラウザがクラッシュする可能性があります\n\n` +
+                  `推奨: HD（1920×1080）で十分な精度が得られます。`
+                );
+              }
             }
           }
           
@@ -5095,11 +5874,34 @@ setUsedTargetFps(targetFps);
       console.log(`💾 Full resolution would use: ${fullResMemoryMB.toFixed(0)}MB`);
       console.log(`💾 Scaled to ${MAX_WIDTH}px would use: ${scaledMemoryMB.toFixed(0)}MB`);
       
-      if (confirm(`4K動画が検出されました（${actualVideoWidth}x${actualVideoHeight}）\n\nフル解像度で処理しますか？\n\n「OK」: フル解像度（${fullResMemoryMB.toFixed(0)}MB使用、高精度）\n「キャンセル」: ${MAX_WIDTH}pxにスケール（${scaledMemoryMB.toFixed(0)}MB使用、推奨）`)) {
-        scale = 1; // フル解像度
-        console.log('✅ Processing at full 4K resolution');
+      // 🎯 修正: デフォルトをHDスケールに変更（confirmの論理を反転）
+      const useFullResolution = confirm(
+        `4K動画が検出されました（${actualVideoWidth}x${actualVideoHeight}）\n` +
+        `\n` +
+        `推奨: 処理速度とメモリ使用量を考慮し、HD（${MAX_WIDTH}px）にスケールして処理します。\n` +
+        `\n` +
+        `【OK】: HD（${MAX_WIDTH}px）にスケール（${scaledMemoryMB.toFixed(0)}MB使用、推奨）\n` +
+        `【キャンセル】: フル解像度（${fullResMemoryMB.toFixed(0)}MB使用、低速）\n` +
+        `\n` +
+        `HD（${MAX_WIDTH}px）にスケールして処理しますか？`
+      );
+      
+      if (useFullResolution) {
+        // OKを選択 → HDにスケール（推奨）
+        console.log(`✅ Scaling to ${MAX_WIDTH}px for performance (recommended)`);
+        // scale は既に計算済み（MAX_WIDTH基準）
       } else {
-        console.log(`✅ Scaling to ${MAX_WIDTH}px for performance`);
+        // キャンセルを選択 → フル解像度
+        scale = 1; // フル解像度
+        console.log('⚠️ Processing at full 4K resolution (slow, high memory)');
+        alert(
+          `フル解像度（${actualVideoWidth}x${actualVideoHeight}）で処理します。\n\n` +
+          `注意:\n` +
+          `- メモリ使用量: 約${fullResMemoryMB.toFixed(0)}MB\n` +
+          `- 処理時間が大幅に長くなります\n` +
+          `- ブラウザがクラッシュする可能性があります\n\n` +
+          `推奨: HD（${MAX_WIDTH}px）で十分な精度が得られます。`
+        );
       }
     }
     
@@ -5441,7 +6243,7 @@ setUsedTargetFps(targetFps);
 
       // 垂直線を描画（太く目立つように）
       ctx.strokeStyle = color;
-      ctx.lineWidth = 8;  // 3 → 8に変更（より太く）
+      ctx.lineWidth = 4;  // スティックピクチャーの線の太さ
       ctx.setLineDash([15, 8]);  // 破線も大きく
       ctx.beginPath();
       ctx.moveTo(clampedX, height);
@@ -5614,7 +6416,7 @@ setUsedTargetFps(targetFps);
         const landmarks = poseResults[idx]!.landmarks;
 
         ctx.strokeStyle = "#00ff00";  // より見やすい緑色
-        ctx.lineWidth = 5;  // 3 → 5に変更（より太く）
+        ctx.lineWidth = 3;  // スティックピクチャーの線の太さ
 
         const connections: [number, number][] = [
           [11, 12],
@@ -10457,23 +11259,108 @@ case 6: {
                     ⏱️ パーン撮影 - スプリットタイマー
                   </h3>
                   
-                  {/* 使い方説明 */}
-                  <div style={{
-                    marginBottom: '16px',
-                    padding: '12px',
-                    background: 'rgba(255,255,255,0.15)',
-                    borderRadius: '8px',
-                    fontSize: '0.9rem',
-                    lineHeight: '1.6'
-                  }}>
-                    <div><strong>📌 使い方:</strong></div>
-                    <div>1. 動画モードまたは手動入力モードを選択</div>
-                    <div>2. 最初にスタート地点（0m）を登録</div>
-                    <div>3. 次にスプリット地点（10m, 20m...）を登録</div>
-                    <div>4. スプリント分析と姿勢分析が自動表示されます</div>
-                    <div style={{ marginTop: '8px', fontSize: '0.85rem', opacity: 0.9 }}>
-                      💡 姿勢データカードをクリックすると、その地点の動画に自動ジャンプします
-                    </div>
+                  {/* 使い方ガイド（折りたたみ式） */}
+                  <div style={{ marginBottom: '16px' }}>
+                    {/* トグルボタン */}
+                    <button
+                      onClick={() => setShowPanningGuide(v => !v)}
+                      style={{
+                        width: '100%',
+                        padding: '10px 14px',
+                        background: 'rgba(255,255,255,0.15)',
+                        border: '1px solid rgba(255,255,255,0.3)',
+                        borderRadius: showPanningGuide ? '8px 8px 0 0' : '8px',
+                        color: 'white',
+                        fontSize: '0.9rem',
+                        fontWeight: 'bold',
+                        cursor: 'pointer',
+                        display: 'flex',
+                        justifyContent: 'space-between',
+                        alignItems: 'center',
+                        transition: 'background 0.2s'
+                      }}
+                    >
+                      <span>📌 使い方・測定手順</span>
+                      <span style={{ fontSize: '0.8rem', opacity: 0.8 }}>
+                        {showPanningGuide ? '▲ 閉じる' : '▼ 開く'}
+                      </span>
+                    </button>
+
+                    {/* ガイド本文（開いているときだけ表示） */}
+                    {showPanningGuide && (
+                      <div style={{
+                        padding: '16px',
+                        background: 'rgba(255,255,255,0.12)',
+                        border: '1px solid rgba(255,255,255,0.3)',
+                        borderTop: 'none',
+                        borderRadius: '0 0 8px 8px',
+                        fontSize: '0.88rem',
+                        lineHeight: '1.8'
+                      }}>
+                        {/* STEP 1 */}
+                        <div style={{ marginBottom: '12px' }}>
+                          <div style={{ fontWeight: 'bold', marginBottom: '4px' }}>
+                            STEP 1 ── 入力モードを選択
+                          </div>
+                          <div style={{ paddingLeft: '12px', opacity: 0.9 }}>
+                            🎬 <strong>動画モード</strong>：ビデオを再生しながらフレームを指定<br/>
+                            ⌨️ <strong>手動入力モード</strong>：タイム計測値を直接入力
+                          </div>
+                        </div>
+
+                        {/* STEP 2 */}
+                        <div style={{ marginBottom: '12px' }}>
+                          <div style={{ fontWeight: 'bold', marginBottom: '4px' }}>
+                            STEP 2 ── スタート登録（t=0）
+                          </div>
+                          <div style={{ paddingLeft: '12px', opacity: 0.9 }}>
+                            🖐️ <strong>手が地面から離れた瞬間</strong>のフレームで「登録」ボタンを押す<br/>
+                            → 0m / 0秒 として記録されます<br/>
+                            ※ 手の位置は0mライン上に固定
+                          </div>
+                        </div>
+
+                        {/* STEP 3 */}
+                        <div style={{ marginBottom: '12px' }}>
+                          <div style={{ fontWeight: 'bold', marginBottom: '4px' }}>
+                            STEP 3 ── スプリット地点を登録
+                          </div>
+                          <div style={{ paddingLeft: '12px', opacity: 0.9 }}>
+                            📏 最初の2区間は <strong>5m間隔</strong>（0→5→10m）<br/>
+                            📏 以降は <strong>10m間隔</strong>（10→20→30m…）<br/>
+                            各バー通過の瞬間に「登録」ボタンを押す<br/>
+                            → タイムはt=0からの経過時間で自動計算
+                          </div>
+                        </div>
+
+                        {/* STEP 4 */}
+                        <div style={{ marginBottom: '12px' }}>
+                          <div style={{ fontWeight: 'bold', marginBottom: '4px' }}>
+                            STEP 4 ── 結果を確認
+                          </div>
+                          <div style={{ paddingLeft: '12px', opacity: 0.9 }}>
+                            📊 区間タイム・速度・加速度が自動計算<br/>
+                            ⚡ H-FVP（力－速度プロファイル）が自動生成<br/>
+                            🧍 各地点の姿勢データが表示されます
+                          </div>
+                        </div>
+
+                        {/* Tips */}
+                        <div style={{
+                          marginTop: '12px',
+                          padding: '10px',
+                          background: 'rgba(255,255,255,0.1)',
+                          borderRadius: '6px',
+                          fontSize: '0.82rem',
+                          opacity: 0.9
+                        }}>
+                          💡 <strong>Tips</strong><br/>
+                          • 姿勢データカードをクリック → その地点の動画フレームに自動ジャンプ<br/>
+                          • 登録ミスは「削除」ボタンで取り消し可能<br/>
+                          • 公式タイム（ピストル基準）はそのまま使わず、手が離れた瞬間を基準にしてください
+                        </div>
+                      </div>
+                    )}
                   </div>
                   
                   {/* 動画情報 */}
@@ -10692,7 +11579,74 @@ case 6: {
                   </div>
 
                 </div>
-                
+
+                {/* 関節角度リアルタイムモニター（パンニングモード） */}
+                {analysisMode === 'panning' && currentAngles && (
+                  <div style={{
+                    marginTop: '10px',
+                    padding: '10px 12px',
+                    background: 'rgba(0,0,0,0.55)',
+                    borderRadius: '8px',
+                    color: 'white',
+                    fontSize: '0.78rem'
+                  }}>
+                    <div style={{
+                      fontWeight: 'bold',
+                      fontSize: '0.8rem',
+                      marginBottom: '6px',
+                      opacity: 0.85
+                    }}>
+                      🦵 関節角度モニター（フレーム {currentFrame}）
+                    </div>
+                    <div style={{
+                      display: 'grid',
+                      gridTemplateColumns: 'repeat(3, 1fr)',
+                      gap: '4px 8px'
+                    }}>
+                      <div>
+                        <span style={{ opacity: 0.7 }}>体幹 </span>
+                        <strong>{currentAngles.trunkAngle?.toFixed(1)}°</strong>
+                        <span style={{ opacity: 0.6, fontSize: '0.72rem', marginLeft: '3px' }}>
+                          {currentAngles.trunkAngle && currentAngles.trunkAngle < 85 ? '前傾'
+                            : currentAngles.trunkAngle && currentAngles.trunkAngle > 95 ? '後傾'
+                            : '垂直'}
+                        </span>
+                      </div>
+                      <div>
+                        <span style={{ opacity: 0.7 }}>左膝 </span>
+                        <strong>{currentAngles.kneeFlex.left?.toFixed(1) ?? '—'}°</strong>
+                      </div>
+                      <div>
+                        <span style={{ opacity: 0.7 }}>右膝 </span>
+                        <strong>{currentAngles.kneeFlex.right?.toFixed(1) ?? '—'}°</strong>
+                      </div>
+                      <div>
+                        <span style={{ opacity: 0.7 }}>左大腿 </span>
+                        <strong>{currentAngles.thighAngle.left?.toFixed(1) ?? '—'}°</strong>
+                      </div>
+                      <div>
+                        <span style={{ opacity: 0.7 }}>右大腿 </span>
+                        <strong>{currentAngles.thighAngle.right?.toFixed(1) ?? '—'}°</strong>
+                      </div>
+                      <div>
+                        <span style={{ opacity: 0.7 }}>左足首 </span>
+                        <strong>{currentAngles.ankleFlex.left?.toFixed(1) ?? '—'}°</strong>
+                      </div>
+                      <div>
+                        <span style={{ opacity: 0.7 }}>右足首 </span>
+                        <strong>{currentAngles.ankleFlex.right?.toFixed(1) ?? '—'}°</strong>
+                      </div>
+                      <div>
+                        <span style={{ opacity: 0.7 }}>左肘 </span>
+                        <strong>{currentAngles.elbowAngle.left?.toFixed(1) ?? '—'}°</strong>
+                      </div>
+                      <div>
+                        <span style={{ opacity: 0.7 }}>右肘 </span>
+                        <strong>{currentAngles.elbowAngle.right?.toFixed(1) ?? '—'}°</strong>
+                      </div>
+                    </div>
+                  </div>
+                )}
 
                 {/* パーン撮影モード: スプリット登録ボタン（動画の下） */}
                 {analysisMode === 'panning' && (
@@ -10749,7 +11703,7 @@ case 6: {
                     </div>
 
                     <div style={{ marginBottom: '12px', fontWeight: 'bold', fontSize: '1.1rem' }}>
-                      {panningSplits.length === 0 ? '🏁 スタート地点を登録（0m地点）' : '⏱️ スプリット地点を登録'}
+                      {panningSplits.length === 0 ? '🏁 スタート登録（手が地面を離れた瞬間）' : '⏱️ スプリット地点を登録'}
                     </div>
                     
                     {/* スタート地点の説明 */}
@@ -10762,9 +11716,9 @@ case 6: {
                         fontSize: '0.85rem',
                         lineHeight: '1.5'
                       }}>
-                        📍 スタート地点（0m）を登録してください。<br/>
+                        🖐️ <strong>手が地面から離れた瞬間</strong>がt=0になります。<br/>
                         {panningInputMode === 'video' 
-                          ? 'ビデオをスタート位置に移動してから「登録」ボタンを押してください。'
+                          ? 'ビデオで手が離れた瞬間のフレームに合わせてから「登録」ボタンを押してください。以降のタイムはこのフレームからの経過時間で自動計算されます。'
                           : 'タイムは自動的に0秒になります。「登録」ボタンを押してください。'}
                       </div>
                     )}
@@ -10785,7 +11739,11 @@ case 6: {
                             type="number"
                             value={distanceInput}
                             onChange={(e) => setDistanceInput(e.target.value)}
-                            placeholder={`推奨: ${panningSplits[panningSplits.length - 1].distance + 10}m`}
+                            placeholder={(() => {
+                              const lastDist = panningSplits[panningSplits.length - 1].distance;
+                              const recommended = lastDist < 10 ? lastDist + 5 : lastDist + 10;
+                              return `推奨: ${recommended}m`;
+                            })()}
                             step="0.1"
                             min="0.1"
                             style={{
@@ -10852,14 +11810,17 @@ case 6: {
                       onClick={() => {
                         // スタート地点（0m）の登録
                         if (panningSplits.length === 0) {
+                          // ビデオモード: 現在のフレームをt=0の基準フレームとして記録
+                          // 手動モード: frame=0, time=0で固定
+                          const startFrame = panningInputMode === 'video' ? currentFrame : 0;
                           const newSplits: PanningSplit[] = [{ 
-                            frame: 0, 
-                            time: 0, 
+                            frame: startFrame, 
+                            time: 0,   // t=0（手が離れた瞬間）
                             distance: 0 
                           }];
                           setPanningSplits(newSplits);
                           setPanningStartIndex(0); // 自動的に開始点に設定
-                          setDistanceInput('10'); // 次の推奨距離（10m）を自動入力
+                          setDistanceInput('5'); // 次の推奨距離（0m→5m）
                           setManualTimeInput(''); // 手動タイム入力をクリア
                           return;
                         }
@@ -10910,7 +11871,9 @@ case 6: {
                         } else {
                           // 動画モード
                           frame = currentFrame;
-                          time = usedTargetFps ? frame / usedTargetFps : 0;
+                          // タイムは「0mフレーム（手が離れた瞬間）からの差分」で計算
+                          const startFrame = panningSplits[0].frame;
+                          time = usedTargetFps ? (frame - startFrame) / usedTargetFps : 0;
                           
                           // 前の地点より大きいかチェック
                           const lastTime = panningSplits[panningSplits.length - 1].time;
@@ -10934,8 +11897,16 @@ case 6: {
                         });
                         setPanningSplits(newSplits);
                         
-                        // 次の推奨距離を自動入力（10m間隔）
-                        const nextDistance = distance + 10;
+                        // 次の推奨距離を自動入力
+                        // 0-5m, 5-10m の最初の2区間は5m間隔、以降は10m間隔
+                        let nextDistance: number;
+                        if (distance < 10) {
+                          // まだ10m未満 → 次は5m刻み
+                          nextDistance = distance + 5;
+                        } else {
+                          // 10m以降 → 10m刻み
+                          nextDistance = distance + 10;
+                        }
                         setDistanceInput(nextDistance.toString());
                         
                         // 手動入力の場合は次の推奨タイムも設定
@@ -10995,10 +11966,31 @@ case 6: {
                         background: 'rgba(255,255,255,0.15)',
                         borderRadius: '8px'
                       }}>
-                        <div style={{ fontWeight: 'bold', marginBottom: '8px', fontSize: '0.95rem' }}>
+                        <div 
+                          onClick={() => toggleAccordion('splitsList')}
+                          style={{ 
+                            fontWeight: 'bold', 
+                            marginBottom: accordionState.splitsList ? '8px' : '0', 
+                            fontSize: '0.95rem',
+                            cursor: 'pointer',
+                            userSelect: 'none',
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: '8px'
+                          }}
+                        >
+                          <span style={{ 
+                            transition: 'transform 0.3s ease',
+                            display: 'inline-block',
+                            transform: accordionState.splitsList ? 'rotate(90deg)' : 'rotate(0deg)',
+                            fontSize: '0.8rem'
+                          }}>
+                            ▶
+                          </span>
                           📊 登録済みスプリット
                         </div>
-                        <div style={{ fontSize: '0.85rem' }}>
+                        {accordionState.splitsList && (
+                          <div style={{ fontSize: '0.85rem' }}>
                           {panningSplits.map((split, idx) => {
                             // スプリットタイム（前の地点からの区間タイム）
                             const splitTime = idx === 0 ? 0 : split.time - panningSplits[idx - 1].time;
@@ -11076,7 +12068,8 @@ case 6: {
                               </div>
                             );
                           })}
-                        </div>
+                          </div>
+                        )}
                       </div>
                     )}
                   </div>
@@ -11321,7 +12314,19 @@ case 6: {
                       display: 'flex', 
                       justifyContent: 'space-between', 
                       alignItems: 'center',
-                      marginBottom: '20px'
+                      marginBottom: '20px',
+                      cursor: 'pointer',
+                      padding: '12px',
+                      background: 'rgba(255,255,255,0.05)',
+                      borderRadius: '8px',
+                      transition: 'all 0.2s'
+                    }}
+                    onClick={() => toggleAccordion('overview')}
+                    onMouseEnter={(e) => {
+                      e.currentTarget.style.background = 'rgba(255,255,255,0.1)';
+                    }}
+                    onMouseLeave={(e) => {
+                      e.currentTarget.style.background = 'rgba(255,255,255,0.05)';
                     }}>
                       <h3 style={{ 
                         margin: '0', 
@@ -11330,19 +12335,26 @@ case 6: {
                         alignItems: 'center',
                         gap: '12px'
                       }}>
-                        📊 スプリント分析
+                        <span style={{ 
+                          fontSize: '1.5rem',
+                          transition: 'transform 0.2s',
+                          transform: accordionState.overview ? 'rotate(90deg)' : 'rotate(0deg)'
+                        }}>
+                          ▶
+                        </span>
+                        📊 分析結果
                         <span style={{ 
                           fontSize: '0.75rem', 
                           padding: '2px 8px', 
                           background: 'rgba(255,255,255,0.2)', 
                           borderRadius: '4px' 
                         }}>
-                          Sprint Analysis
+                          Analysis Results
                         </span>
                       </h3>
                       
                       {/* 自動微調整ボタンと元に戻すボタン */}
-                      <div style={{ display: 'flex', gap: '12px' }}>
+                      <div style={{ display: 'flex', gap: '12px' }} onClick={(e) => e.stopPropagation()}>
                         <button
                           onClick={autoAdjustSplits}
                           disabled={!panningSplits || panningSplits.length < 4}
@@ -11421,7 +12433,10 @@ case 6: {
                       </div>
                     </div>
                     
-                    {/* 区間データ表示 */}
+                    {/* 分析結果コンテンツ（アコーディオン） */}
+                    {accordionState.overview && (
+                    <>
+                    {/* サマリーカード */}
                     <div style={{
                       display: 'grid',
                       gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))',
@@ -11463,23 +12478,43 @@ case 6: {
                         background: 'rgba(255,255,255,0.15)',
                         borderRadius: '8px'
                       }}>
-                        <div style={{ fontSize: '0.85rem', opacity: 0.9, marginBottom: '4px' }}>最高速度</div>
+                        <div style={{ fontSize: '0.85rem', opacity: 0.9, marginBottom: '4px' }}>実測最高速度</div>
                         <div style={{ fontSize: '1.5rem', fontWeight: 'bold' }}>
                           {panningSprintAnalysis.maxSpeed.toFixed(2)} m/s
+                        </div>
+                        <div style={{ fontSize: '0.7rem', opacity: 0.7, marginTop: '4px' }}>
+                          区間平均の最大値
                         </div>
                       </div>
                     </div>
 
-                    {/* 区間ごとの詳細 */}
+                    {/* 区間ごとの詳細（サブアコーディオン） */}
                     <div style={{
                       marginTop: '20px'
                     }}>
                       <h4 style={{ 
                         margin: '0 0 12px 0',
-                        fontSize: '1.1rem'
-                      }}>
+                        fontSize: '1.1rem',
+                        cursor: 'pointer',
+                        padding: '8px',
+                        background: 'rgba(255,255,255,0.05)',
+                        borderRadius: '8px',
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '8px'
+                      }}
+                      onClick={() => toggleAccordion('intervals')}>
+                        <span style={{ 
+                          fontSize: '1rem',
+                          transition: 'transform 0.2s',
+                          transform: accordionState.intervals ? 'rotate(90deg)' : 'rotate(0deg)'
+                        }}>
+                          ▶
+                        </span>
                         📏 区間データ
                       </h4>
+                      {accordionState.intervals && (
+                      <>
                       {panningSprintAnalysis.intervals.map((interval, idx) => (
                         <div key={idx} style={{
                           padding: '12px',
@@ -11511,10 +12546,278 @@ case 6: {
                           </div>
                         </div>
                       ))}
+                      </>
+                      )}
                     </div>
                     
-                    {/* H-FVP分析（Horizontal Force-Velocity Profile） */}
+                    {/* H-FVP分析（サブアコーディオン） */}
                     {panningSprintAnalysis.hfvpData && (
+                    <div style={{ marginTop: '24px' }}>
+                      <h4 style={{ 
+                        margin: '0 0 12px 0',
+                        fontSize: '1.1rem',
+                        cursor: 'pointer',
+                        padding: '8px',
+                        background: 'rgba(255,255,255,0.05)',
+                        borderRadius: '8px',
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '8px'
+                      }}
+                      onClick={() => toggleAccordion('hfvpAnalysis')}>
+                        <span style={{ 
+                          fontSize: '1rem',
+                          transition: 'transform 0.2s',
+                          transform: accordionState.hfvpAnalysis ? 'rotate(90deg)' : 'rotate(0deg)'
+                        }}>
+                          ▶
+                        </span>
+                        🔬 H-FVP分析
+                        {panningSprintAnalysis.hfvpData.quality && (
+                          <span style={{
+                            fontSize: '0.7rem',
+                            padding: '2px 6px',
+                            background: panningSprintAnalysis.hfvpData.quality.grade === '良' 
+                              ? 'rgba(16,185,129,0.3)' 
+                              : panningSprintAnalysis.hfvpData.quality.grade === '可'
+                              ? 'rgba(251,146,60,0.3)'
+                              : 'rgba(239,68,68,0.3)',
+                            borderRadius: '4px'
+                          }}>
+                            品質: {panningSprintAnalysis.hfvpData.quality.grade}
+                          </span>
+                        )}
+                      </h4>
+                      {accordionState.hfvpAnalysis && (
+                        <div style={{ marginTop: '12px' }}>
+                          {/* F0, V0, Pmax */}
+                          <div style={{
+                            display: 'grid',
+                            gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))',
+                            gap: '12px',
+                            marginBottom: '16px'
+                          }}>
+                            <div style={{ padding: '12px', background: 'rgba(255,255,255,0.1)', borderRadius: '8px' }}>
+                              <div style={{ fontSize: '0.8rem', opacity: 0.8 }}>F0 (最大推進力)</div>
+                              <div style={{ fontSize: '1.3rem', fontWeight: 'bold' }}>{panningSprintAnalysis.hfvpData.F0.toFixed(1)} N</div>
+                            </div>
+                            <div style={{ padding: '12px', background: 'rgba(255,255,255,0.1)', borderRadius: '8px' }}>
+                              <div style={{ fontSize: '0.8rem', opacity: 0.8 }}>V0 (理論最大速度)</div>
+                              <div style={{ fontSize: '1.3rem', fontWeight: 'bold' }}>{panningSprintAnalysis.hfvpData.v0.toFixed(2)} m/s</div>
+                            </div>
+                            <div style={{ padding: '12px', background: 'rgba(255,255,255,0.1)', borderRadius: '8px' }}>
+                              <div style={{ fontSize: '0.8rem', opacity: 0.8 }}>Pmax (最大パワー)</div>
+                              <div style={{ fontSize: '1.3rem', fontWeight: 'bold' }}>{panningSprintAnalysis.hfvpData.Pmax.toFixed(0)} W</div>
+                            </div>
+                          </div>
+                          {/* 品質警告 */}
+                          {panningSprintAnalysis.hfvpData.quality && panningSprintAnalysis.hfvpData.quality.warnings.length > 0 && (
+                            <div style={{
+                              padding: '12px',
+                              background: 'rgba(251,146,60,0.2)',
+                              borderRadius: '8px',
+                              marginBottom: '12px',
+                              fontSize: '0.85rem'
+                            }}>
+                              <div style={{ fontWeight: 'bold', marginBottom: '4px' }}>⚠️ 品質に関する注意</div>
+                              <ul style={{ margin: '0', paddingLeft: '20px' }}>
+                                {panningSprintAnalysis.hfvpData.quality.warnings.map((w, i) => (
+                                  <li key={i}>{w}</li>
+                                ))}
+                              </ul>
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                    )}
+                    </>
+                    )}
+                    
+                    {/* ===== 目標達成カード（ADD）===== */}
+                    {goalAchievement && (
+                      <div style={{
+                        marginTop: '24px',
+                        padding: '20px',
+                        background: goalAchievement.isAchieved 
+                          ? 'linear-gradient(135deg, rgba(16,185,129,0.2) 0%, rgba(5,150,105,0.2) 100%)'
+                          : 'linear-gradient(135deg, rgba(251,146,60,0.2) 0%, rgba(249,115,22,0.2) 100%)',
+                        borderRadius: '12px',
+                        border: goalAchievement.isAchieved
+                          ? '2px solid rgba(16,185,129,0.4)'
+                          : '2px solid rgba(251,146,60,0.4)'
+                      }}>
+                        <h4 style={{ 
+                          margin: '0 0 16px 0',
+                          fontSize: '1.2rem',
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: '8px',
+                          cursor: 'pointer',
+                          padding: '8px',
+                          background: 'rgba(255,255,255,0.05)',
+                          borderRadius: '8px'
+                        }}
+                        onClick={() => toggleAccordion('goalAchievement')}>
+                          <span style={{ 
+                            fontSize: '1.2rem',
+                            transition: 'transform 0.2s',
+                            transform: accordionState.goalAchievement ? 'rotate(90deg)' : 'rotate(0deg)'
+                          }}>
+                            ▶
+                          </span>
+                          🎯 目標タイム達成への道
+                          <span style={{ 
+                            fontSize: '0.7rem', 
+                            padding: '2px 6px', 
+                            background: 'rgba(255,255,255,0.2)', 
+                            borderRadius: '4px' 
+                          }}>
+                            Goal Achievement
+                          </span>
+                        </h4>
+                        
+                        {accordionState.goalAchievement && (
+                        <>
+                        
+                        {/* タイム比較 */}
+                        <div style={{
+                          display: 'grid',
+                          gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))',
+                          gap: '12px',
+                          marginBottom: '16px'
+                        }}>
+                          <div style={{
+                            padding: '14px',
+                            background: 'rgba(255,255,255,0.15)',
+                            borderRadius: '8px'
+                          }}>
+                            <div style={{ fontSize: '0.75rem', opacity: 0.8, marginBottom: '4px' }}>目標タイム</div>
+                            <div style={{ fontSize: '2rem', fontWeight: 'bold' }}>
+                              {goalAchievement.goalTime}
+                            </div>
+                            <div style={{ fontSize: '0.7rem', opacity: 0.7 }}>秒</div>
+                          </div>
+                          
+                          <div style={{
+                            padding: '14px',
+                            background: 'rgba(255,255,255,0.15)',
+                            borderRadius: '8px'
+                          }}>
+                            <div style={{ fontSize: '0.75rem', opacity: 0.8, marginBottom: '4px' }}>50mタイム（実測）</div>
+                            <div style={{ fontSize: '2rem', fontWeight: 'bold' }}>
+                              {panningSprintAnalysis.totalTime.toFixed(2)}
+                            </div>
+                            <div style={{ fontSize: '0.7rem', opacity: 0.7 }}>秒</div>
+                          </div>
+                          
+                          <div style={{
+                            padding: '14px',
+                            background: 'rgba(139,92,246,0.3)',
+                            borderRadius: '8px',
+                            border: '2px solid rgba(139,92,246,0.5)'
+                          }}>
+                            <div style={{ fontSize: '0.75rem', opacity: 0.8, marginBottom: '4px' }}>100m予測タイム</div>
+                            <div style={{ fontSize: '2rem', fontWeight: 'bold' }}>
+                              {panningSprintAnalysis.estimated100mTime.toFixed(2)}
+                            </div>
+                            <div style={{ fontSize: '0.7rem', opacity: 0.7 }}>秒</div>
+                          </div>
+                          
+                          <div style={{
+                            padding: '14px',
+                            background: goalAchievement.isAchieved
+                              ? 'rgba(16,185,129,0.3)'
+                              : 'rgba(239,68,68,0.3)',
+                            borderRadius: '8px'
+                          }}>
+                            <div style={{ fontSize: '0.75rem', opacity: 0.8, marginBottom: '4px' }}>
+                              {goalAchievement.isAchieved ? '目標より速い' : 'あと（不足）'}
+                            </div>
+                            <div style={{ fontSize: '2rem', fontWeight: 'bold' }}>
+                              {goalAchievement.isAchieved 
+                                ? `-${Math.abs(goalAchievement.gap).toFixed(3)}`
+                                : `+${Math.abs(goalAchievement.gap).toFixed(3)}`}
+                            </div>
+                            <div style={{ fontSize: '0.7rem', opacity: 0.7 }}>秒（予測 − 目標）</div>
+                          </div>
+                        </div>
+                        
+                        {/* 達成度バー */}
+                        <div style={{
+                          padding: '14px',
+                          background: 'rgba(255,255,255,0.1)',
+                          borderRadius: '8px',
+                          marginBottom: '16px'
+                        }}>
+                          <div style={{
+                            display: 'flex',
+                            justifyContent: 'space-between',
+                            alignItems: 'center',
+                            marginBottom: '8px'
+                          }}>
+                            <span style={{ fontSize: '0.85rem', fontWeight: 'bold' }}>達成度</span>
+                            <span style={{ fontSize: '1.5rem', fontWeight: 'bold' }}>
+                              {goalAchievement.achievement.toFixed(1)}%
+                            </span>
+                          </div>
+                          <div style={{
+                            width: '100%',
+                            height: '24px',
+                            background: 'rgba(255,255,255,0.2)',
+                            borderRadius: '12px',
+                            overflow: 'hidden',
+                            position: 'relative'
+                          }}>
+                            <div style={{
+                              width: `${Math.min(100, goalAchievement.achievement)}%`,
+                              height: '100%',
+                              background: goalAchievement.isAchieved
+                                ? 'linear-gradient(90deg, #10b981 0%, #059669 100%)'
+                                : 'linear-gradient(90deg, #fb923c 0%, #f97316 100%)',
+                              transition: 'width 0.5s ease',
+                              display: 'flex',
+                              alignItems: 'center',
+                              justifyContent: 'flex-end',
+                              paddingRight: '8px'
+                            }}>
+                              {goalAchievement.achievement >= 10 && (
+                                <span style={{ fontSize: '0.7rem', fontWeight: 'bold', color: 'white' }}>
+                                  {goalAchievement.achievement.toFixed(1)}%
+                                </span>
+                              )}
+                            </div>
+                          </div>
+                        </div>
+                        
+                        {/* 改善アドバイス */}
+                        <div style={{
+                          padding: '14px',
+                          background: 'rgba(255,255,255,0.1)',
+                          borderRadius: '8px'
+                        }}>
+                          <h5 style={{ margin: '0 0 10px 0', fontSize: '0.9rem', fontWeight: 'bold' }}>
+                            {goalAchievement.isAchieved ? '🎉 おめでとうございます！' : '💪 改善アドバイス'}
+                          </h5>
+                          <ul style={{ 
+                            margin: '0', 
+                            paddingLeft: '20px',
+                            fontSize: '0.85rem',
+                            lineHeight: '1.8'
+                          }}>
+                            {goalAchievement.suggestions.map((suggestion, idx) => (
+                              <li key={idx} style={{ marginBottom: '6px' }}>{suggestion}</li>
+                            ))}
+                          </ul>
+                        </div>
+                        </>
+                        )}
+                      </div>
+                    )}
+                    
+
+                    {/* ===== H-FVP結果パネル（ADD/REPLACE）===== */}
+                    {hfvpDashboard && (
                       <div style={{
                         marginTop: '24px',
                         padding: '20px',
@@ -11529,36 +12832,34 @@ case 6: {
                           alignItems: 'center',
                           gap: '8px'
                         }}>
-                          🔬 H-FVP分析
+                          🔬 H-FVP結果
                           <span style={{ 
                             fontSize: '0.7rem', 
                             padding: '2px 6px', 
                             background: 'rgba(255,255,255,0.2)', 
                             borderRadius: '4px' 
                           }}>
-                            Force-Velocity Profile
+                            Horizontal Force-Velocity Profile
                           </span>
                         </h4>
                         
-                        {/* 主要指標 */}
+                        {/* 1段目: F0(相対), V0, Pmax(相対), RFmax */}
                         <div style={{
                           display: 'grid',
-                          gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))',
+                          gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))',
                           gap: '12px',
-                          marginBottom: '20px'
+                          marginBottom: '12px'
                         }}>
                           <div style={{
                             padding: '14px',
                             background: 'rgba(255,255,255,0.15)',
                             borderRadius: '8px'
                           }}>
-                            <div style={{ fontSize: '0.8rem', opacity: 0.9, marginBottom: '4px' }}>最大推進力 F0</div>
-                            <div style={{ fontSize: '1.4rem', fontWeight: 'bold' }}>
-                              {panningSprintAnalysis.hfvpData.F0.toFixed(1)} N
+                            <div style={{ fontSize: '0.75rem', opacity: 0.8, marginBottom: '4px' }}>F0（相対）</div>
+                            <div style={{ fontSize: '2rem', fontWeight: 'bold' }}>
+                              {hfvpDashboard.f0Rel}
                             </div>
-                            <div style={{ fontSize: '0.7rem', opacity: 0.7, marginTop: '2px' }}>
-                              体重 × 初期加速度
-                            </div>
+                            <div style={{ fontSize: '0.7rem', opacity: 0.7 }}>N/kg</div>
                           </div>
                           
                           <div style={{
@@ -11566,13 +12867,11 @@ case 6: {
                             background: 'rgba(255,255,255,0.15)',
                             borderRadius: '8px'
                           }}>
-                            <div style={{ fontSize: '0.8rem', opacity: 0.9, marginBottom: '4px' }}>理論最大速度 V0</div>
-                            <div style={{ fontSize: '1.4rem', fontWeight: 'bold' }}>
-                              {panningSprintAnalysis.hfvpData.v0.toFixed(2)} m/s
+                            <div style={{ fontSize: '0.75rem', opacity: 0.8, marginBottom: '4px' }}>V0（理論最大速度）</div>
+                            <div style={{ fontSize: '2rem', fontWeight: 'bold' }}>
+                              {hfvpDashboard.v0}
                             </div>
-                            <div style={{ fontSize: '0.7rem', opacity: 0.7, marginTop: '2px' }}>
-                              加速度ゼロでの速度
-                            </div>
+                            <div style={{ fontSize: '0.7rem', opacity: 0.7 }}>m/s ※理論値</div>
                           </div>
                           
                           <div style={{
@@ -11580,24 +12879,162 @@ case 6: {
                             background: 'rgba(255,255,255,0.15)',
                             borderRadius: '8px'
                           }}>
-                            <div style={{ fontSize: '0.8rem', opacity: 0.9, marginBottom: '4px' }}>最大パワー Pmax</div>
-                            <div style={{ fontSize: '1.4rem', fontWeight: 'bold' }}>
-                              {panningSprintAnalysis.hfvpData.Pmax.toFixed(0)} W
+                            <div style={{ fontSize: '0.75rem', opacity: 0.8, marginBottom: '4px' }}>Pmax（相対）</div>
+                            <div style={{ fontSize: '2rem', fontWeight: 'bold' }}>
+                              {hfvpDashboard.pmaxRel}
                             </div>
-                            <div style={{ fontSize: '0.7rem', opacity: 0.7, marginTop: '2px' }}>
-                              F0 × V0 / 4
+                            <div style={{ fontSize: '0.7rem', opacity: 0.7 }}>W/kg</div>
+                          </div>
+                          
+                          <div style={{
+                            padding: '14px',
+                            background: 'rgba(255,255,255,0.15)',
+                            borderRadius: '8px'
+                          }}>
+                            <div style={{ fontSize: '0.75rem', opacity: 0.8, marginBottom: '4px' }}>RFmax</div>
+                            <div style={{ fontSize: '2rem', fontWeight: 'bold' }}>
+                              {hfvpDashboard.rfmax !== null ? hfvpDashboard.rfmax : '-'}
                             </div>
+                            <div style={{ fontSize: '0.7rem', opacity: 0.7 }}>%</div>
                           </div>
                         </div>
                         
-                        {/* 各地点のH-FVP指標 */}
+                        {/* 2段目: DRF, Vmax, τ */}
+                        <div style={{
+                          display: 'grid',
+                          gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))',
+                          gap: '12px',
+                          marginBottom: '16px'
+                        }}>
+                          <div style={{
+                            padding: '14px',
+                            background: 'rgba(255,255,255,0.15)',
+                            borderRadius: '8px'
+                          }}>
+                            <div style={{ fontSize: '0.75rem', opacity: 0.8, marginBottom: '4px' }}>DRF</div>
+                            <div style={{ fontSize: '2rem', fontWeight: 'bold' }}>
+                              {hfvpDashboard.drf !== null ? hfvpDashboard.drf : '-'}
+                            </div>
+                            <div style={{ fontSize: '0.7rem', opacity: 0.7 }}>% per m/s</div>
+                          </div>
+                          
+                          <div style={{
+                            padding: '14px',
+                            background: 'rgba(255,255,255,0.15)',
+                            borderRadius: '8px'
+                          }}>
+                            <div style={{ fontSize: '0.75rem', opacity: 0.8, marginBottom: '4px' }}>Vmax（実測）</div>
+                            <div style={{ fontSize: '2rem', fontWeight: 'bold' }}>
+                              {hfvpDashboard.vmax}
+                            </div>
+                            <div style={{ fontSize: '0.7rem', opacity: 0.7 }}>m/s</div>
+                          </div>
+                          
+                          <div style={{
+                            padding: '14px',
+                            background: 'rgba(255,255,255,0.15)',
+                            borderRadius: '8px'
+                          }}>
+                            <div style={{ fontSize: '0.75rem', opacity: 0.8, marginBottom: '4px' }}>τ（tau）</div>
+                            <div style={{ fontSize: '2rem', fontWeight: 'bold' }}>
+                              {hfvpDashboard.tau !== null ? hfvpDashboard.tau : '-'}
+                            </div>
+                            <div style={{ fontSize: '0.7rem', opacity: 0.7 }}>s</div>
+                          </div>
+                        </div>
+                        
+                        {/* データ品質 */}
+                        <div style={{
+                          padding: '14px',
+                          background: 'rgba(255,255,255,0.1)',
+                          borderRadius: '8px',
+                          marginBottom: '20px'
+                        }}>
+                          <h5 style={{ margin: '0 0 10px 0', fontSize: '0.9rem', fontWeight: 'bold' }}>データ品質</h5>
+                          <div style={{
+                            display: 'grid',
+                            gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))',
+                            gap: '10px'
+                          }}>
+                            <div style={{
+                              padding: '10px',
+                              background: 'rgba(255,255,255,0.1)',
+                              borderRadius: '6px',
+                              display: 'flex',
+                              alignItems: 'center',
+                              justifyContent: 'space-between'
+                            }}>
+                              <div>
+                                <div style={{ fontSize: '0.75rem', opacity: 0.8 }}>F-v回帰 R²</div>
+                                <div style={{ fontSize: '1.3rem', fontWeight: 'bold' }}>
+                                  {hfvpDashboard.fvR2 !== null ? hfvpDashboard.fvR2 : '-'}
+                                </div>
+                              </div>
+                              <div style={{ fontSize: '1.1rem', fontWeight: 'bold' }}>{hfvpDashboard.fvQuality}</div>
+                            </div>
+                            <div style={{
+                              padding: '10px',
+                              background: 'rgba(255,255,255,0.1)',
+                              borderRadius: '6px',
+                              display: 'flex',
+                              alignItems: 'center',
+                              justifyContent: 'space-between'
+                            }}>
+                              <div>
+                                <div style={{ fontSize: '0.75rem', opacity: 0.8 }}>位置フィット R²</div>
+                                <div style={{ fontSize: '1.3rem', fontWeight: 'bold' }}>
+                                  {hfvpDashboard.posR2 !== null ? hfvpDashboard.posR2 : '-'}
+                                </div>
+                              </div>
+                              <div style={{ fontSize: '1.1rem', fontWeight: 'bold' }}>{hfvpDashboard.posQuality}</div>
+                            </div>
+                          </div>
+                        </div>
+
+                        {/* 回帰採用点・除外点の表示 */}
+                        {panningSprintAnalysis.hfvpData?.summary && (
+                          <div style={{
+                            marginTop: '16px',
+                            padding: '12px',
+                            background: 'rgba(255,255,255,0.08)',
+                            borderRadius: '8px',
+                            fontSize: '0.82rem',
+                            lineHeight: '1.7'
+                          }}>
+                            <div style={{ fontWeight: 'bold', marginBottom: '6px', fontSize: '0.88rem' }}>
+                              🔬 F-v回帰の採用点・除外点
+                            </div>
+                            <div style={{ marginBottom: '4px' }}>
+                              <span style={{ color: '#86efac', fontWeight: 'bold' }}>✅ 採用（{panningSprintAnalysis.hfvpData.summary.usedPoints}点）：</span>
+                              <span style={{ opacity: 0.9 }}>
+                                {panningSprintAnalysis.hfvpData.summary.usedSections.length > 0
+                                  ? panningSprintAnalysis.hfvpData.summary.usedSections.join('、')
+                                  : '—'}
+                              </span>
+                            </div>
+                            {panningSprintAnalysis.hfvpData.summary.excludedSections.length > 0 && (
+                              <div>
+                                <span style={{ color: '#fca5a5', fontWeight: 'bold' }}>❌ 除外（{panningSprintAnalysis.hfvpData.summary.excludedSections.length}点）：</span>
+                                <span style={{ opacity: 0.9 }}>
+                                  {panningSprintAnalysis.hfvpData.summary.excludedSections.join('、')}
+                                  <span style={{ opacity: 0.7, marginLeft: '6px' }}>（減速/低加速）</span>
+                                </span>
+                              </div>
+                            )}
+                            <div style={{ marginTop: '6px', opacity: 0.7, fontSize: '0.78rem' }}>
+                              採用条件: 加速度 &gt; 0.2 m/s² かつ 速度が維持/増加（許容幅 ±0.10 m/s）かつ Vmax区間以前
+                            </div>
+                          </div>
+                        )}
+
+                        {/* 各区間代表値のH-FVP指標 */}
                         <div style={{ marginTop: '20px' }}>
                           <h5 style={{ 
                             margin: '0 0 12px 0',
                             fontSize: '1rem',
                             opacity: 0.95
                           }}>
-                            📊 各地点の力・速度・パワー
+                            📊 各区間代表値の力・速度・パワー・RF
                           </h5>
                           <div style={{
                             display: 'grid',
@@ -11614,7 +13051,7 @@ case 6: {
                                 fontSize: '0.85rem'
                               }}>
                                 <div>
-                                  <div style={{ opacity: 0.8, fontSize: '0.75rem' }}>地点</div>
+                                  <div style={{ opacity: 0.8, fontSize: '0.75rem' }}>区間代表</div>
                                   <div style={{ fontWeight: 'bold' }}>{point.distance.toFixed(0)}m</div>
                                 </div>
                                 <div>
@@ -11630,8 +13067,8 @@ case 6: {
                                   <div style={{ fontWeight: 'bold' }}>{point.power.toFixed(0)} W</div>
                                 </div>
                                 <div>
-                                  <div style={{ opacity: 0.8, fontSize: '0.75rem' }}>DRF</div>
-                                  <div style={{ fontWeight: 'bold' }}>{point.drf.toFixed(1)} %</div>
+                                  <div style={{ opacity: 0.8, fontSize: '0.75rem' }}>RF</div>
+                                  <div style={{ fontWeight: 'bold' }}>{point.rf.toFixed(1)} %</div>
                                 </div>
                               </div>
                             ))}
@@ -11657,13 +13094,218 @@ case 6: {
                             <canvas id="fv-curve-chart" style={{ width: '100%', height: '300px' }}></canvas>
                           </div>
                         </div>
+                        
+                        {/* 🎯 AI改善提案 */}
+                        {panningSprintAnalysis.hfvpData.improvementGoals && (
+                          <div style={{ marginTop: '32px' }}>
+                            <h5 style={{ 
+                              margin: '0 0 16px 0',
+                              fontSize: '1.2rem',
+                              display: 'flex',
+                              alignItems: 'center',
+                              gap: '8px',
+                              cursor: 'pointer',
+                              padding: '12px',
+                              background: 'rgba(255,255,255,0.05)',
+                              borderRadius: '8px',
+                              transition: 'all 0.2s'
+                            }}
+                            onClick={() => toggleAccordion('aiImprovements')}
+                            onMouseEnter={(e) => {
+                              e.currentTarget.style.background = 'rgba(255,255,255,0.1)';
+                            }}
+                            onMouseLeave={(e) => {
+                              e.currentTarget.style.background = 'rgba(255,255,255,0.05)';
+                            }}>
+                              <span style={{ 
+                                fontSize: '1.2rem',
+                                transition: 'transform 0.2s',
+                                transform: accordionState.aiImprovements ? 'rotate(90deg)' : 'rotate(0deg)'
+                              }}>
+                                ▶
+                              </span>
+                              🎯 AI改善提案
+                              <span style={{ 
+                                fontSize: '0.7rem', 
+                                padding: '2px 8px', 
+                                background: 'rgba(255,255,255,0.2)', 
+                                borderRadius: '4px' 
+                              }}>
+                                Improvement Goals
+                              </span>
+                            </h5>
+                            
+                            {accordionState.aiImprovements && (
+                            <>
+                            
+                            {/* 総合評価 */}
+                            <div style={{
+                              padding: '16px',
+                              background: 'rgba(255,255,255,0.2)',
+                              borderRadius: '10px',
+                              marginBottom: '20px',
+                              border: '2px solid rgba(255,255,255,0.3)'
+                            }}>
+                              <div style={{ 
+                                display: 'flex', 
+                                justifyContent: 'space-between', 
+                                alignItems: 'center',
+                                marginBottom: '12px'
+                              }}>
+                                <div style={{ fontSize: '1rem', fontWeight: 'bold' }}>総合スコア</div>
+                                <div style={{ 
+                                  fontSize: '1.8rem', 
+                                  fontWeight: 'bold',
+                                  color: panningSprintAnalysis.hfvpData.improvementGoals.overall_score >= 95 ? '#10b981' :
+                                         panningSprintAnalysis.hfvpData.improvementGoals.overall_score >= 85 ? '#3b82f6' :
+                                         panningSprintAnalysis.hfvpData.improvementGoals.overall_score >= 70 ? '#f59e0b' : '#ef4444'
+                                }}>
+                                  {panningSprintAnalysis.hfvpData.improvementGoals.overall_score}点
+                                </div>
+                              </div>
+                              <div style={{
+                                padding: '8px 12px',
+                                background: 'rgba(255,255,255,0.15)',
+                                borderRadius: '6px',
+                                fontSize: '0.85rem',
+                                marginBottom: '8px'
+                              }}>
+                                レベル: <strong>{panningSprintAnalysis.hfvpData.improvementGoals.overall_level}</strong>
+                              </div>
+                              <div style={{ 
+                                fontSize: '0.9rem', 
+                                lineHeight: '1.5',
+                                opacity: 0.95
+                              }}>
+                                {panningSprintAnalysis.hfvpData.improvementGoals.summary}
+                              </div>
+                            </div>
+                            
+                            {/* 各項目の改善目標 */}
+                            {panningSprintAnalysis.hfvpData.improvementGoals.goals.length > 0 && (
+                              <div style={{
+                                display: 'grid',
+                                gap: '16px'
+                              }}>
+                                {panningSprintAnalysis.hfvpData.improvementGoals.goals.map((goal, idx) => (
+                                  <div key={idx} style={{
+                                    padding: '16px',
+                                    background: 'rgba(255,255,255,0.15)',
+                                    borderRadius: '10px',
+                                    border: '1px solid rgba(255,255,255,0.25)'
+                                  }}>
+                                    <div style={{ 
+                                      display: 'flex', 
+                                      justifyContent: 'space-between',
+                                      alignItems: 'center',
+                                      marginBottom: '12px'
+                                    }}>
+                                      <h6 style={{ 
+                                        margin: 0, 
+                                        fontSize: '1rem',
+                                        fontWeight: 'bold'
+                                      }}>
+                                        {goal.category}
+                                      </h6>
+                                      <span style={{
+                                        padding: '4px 10px',
+                                        background: goal.level === '初級' ? 'rgba(239,68,68,0.3)' :
+                                                   goal.level === '中級' ? 'rgba(245,158,11,0.3)' :
+                                                   'rgba(59,130,246,0.3)',
+                                        borderRadius: '6px',
+                                        fontSize: '0.75rem',
+                                        fontWeight: 'bold'
+                                      }}>
+                                        {goal.level}
+                                      </span>
+                                    </div>
+                                    
+                                    <div style={{
+                                      display: 'grid',
+                                      gridTemplateColumns: 'repeat(3, 1fr)',
+                                      gap: '12px',
+                                      marginBottom: '12px',
+                                      fontSize: '0.85rem'
+                                    }}>
+                                      <div>
+                                        <div style={{ opacity: 0.8, fontSize: '0.75rem' }}>現在値</div>
+                                        <div style={{ fontWeight: 'bold', fontSize: '1rem' }}>{goal.current}</div>
+                                      </div>
+                                      <div>
+                                        <div style={{ opacity: 0.8, fontSize: '0.75rem' }}>目標値</div>
+                                        <div style={{ fontWeight: 'bold', fontSize: '1rem', color: '#10b981' }}>{goal.target}</div>
+                                      </div>
+                                      <div>
+                                        <div style={{ opacity: 0.8, fontSize: '0.75rem' }}>優秀値</div>
+                                        <div style={{ fontWeight: 'bold', fontSize: '1rem', color: '#3b82f6' }}>{goal.excellent}</div>
+                                      </div>
+                                    </div>
+                                    
+                                    <div style={{
+                                      padding: '10px',
+                                      background: 'rgba(0,0,0,0.2)',
+                                      borderRadius: '6px',
+                                      marginBottom: '10px'
+                                    }}>
+                                      <div style={{ fontSize: '0.75rem', opacity: 0.9, marginBottom: '4px' }}>
+                                        必要な改善率
+                                      </div>
+                                      <div style={{ 
+                                        fontSize: '1.2rem', 
+                                        fontWeight: 'bold',
+                                        color: '#fbbf24'
+                                      }}>
+                                        +{goal.improvement}
+                                      </div>
+                                    </div>
+                                    
+                                    <div style={{
+                                      padding: '12px',
+                                      background: 'rgba(255,255,255,0.1)',
+                                      borderRadius: '6px',
+                                      fontSize: '0.85rem',
+                                      lineHeight: '1.5'
+                                    }}>
+                                      <div style={{ 
+                                        fontWeight: 'bold', 
+                                        marginBottom: '6px',
+                                        opacity: 0.9
+                                      }}>
+                                        💡 推奨トレーニング
+                                      </div>
+                                      {goal.recommendation}
+                                    </div>
+                                  </div>
+                                ))}
+                              </div>
+                            )}
+                            
+                            {panningSprintAnalysis.hfvpData.improvementGoals.goals.length === 0 && (
+                              <div style={{
+                                padding: '20px',
+                                background: 'rgba(16,185,129,0.2)',
+                                borderRadius: '10px',
+                                border: '2px solid rgba(16,185,129,0.4)',
+                                textAlign: 'center',
+                                fontSize: '1rem'
+                              }}>
+                                🎉 素晴らしい！すべての指標が目標値を達成しています！<br/>
+                                <span style={{ fontSize: '0.85rem', opacity: 0.9 }}>
+                                  現状維持とさらなる向上を目指してトレーニングを継続しましょう。
+                                </span>
+                              </div>
+                            )}
+                          </>
+                          )}
+                          </div>
+                        )}
                       </div>
                     )}
                   </div>
                 )}
 
-                {/* パーン撮影モード: H-FVP分析 */}
-                {analysisMode === 'panning' && hfvpAnalysis && (
+                {/* パーン撮影モード: H-FVP分析 - 統合済みのため削除 */}
+                {false && analysisMode === 'panning' && hfvpAnalysis && (
                   <div style={{
                     background: 'linear-gradient(135deg, #ec4899 0%, #8b5cf6 100%)',
                     borderRadius: '16px',
@@ -11677,7 +13319,19 @@ case 6: {
                       display: 'flex', 
                       justifyContent: 'space-between', 
                       alignItems: 'center',
-                      marginBottom: '20px'
+                      marginBottom: '20px',
+                      cursor: 'pointer',
+                      padding: '12px',
+                      background: 'rgba(255,255,255,0.05)',
+                      borderRadius: '8px',
+                      transition: 'all 0.2s'
+                    }}
+                    onClick={() => toggleAccordion('hfvpAnalysis')}
+                    onMouseEnter={(e) => {
+                      e.currentTarget.style.background = 'rgba(255,255,255,0.1)';
+                    }}
+                    onMouseLeave={(e) => {
+                      e.currentTarget.style.background = 'rgba(255,255,255,0.05)';
                     }}>
                       <h3 style={{ 
                         margin: '0', 
@@ -11686,6 +13340,13 @@ case 6: {
                         alignItems: 'center',
                         gap: '12px'
                       }}>
+                        <span style={{ 
+                          fontSize: '1.5rem',
+                          transition: 'transform 0.2s',
+                          transform: accordionState.hfvpAnalysis ? 'rotate(90deg)' : 'rotate(0deg)'
+                        }}>
+                          ▶
+                        </span>
                         🔬 H-FVP分析
                         <span style={{ 
                           fontSize: '0.75rem', 
@@ -11697,6 +13358,9 @@ case 6: {
                         </span>
                       </h3>
                     </div>
+                    
+                    {accordionState.hfvpAnalysis && (
+                    <>
                     
                     {/* 主要指標 */}
                     <div style={{
@@ -11910,10 +13574,13 @@ case 6: {
                     }}>
                       <strong>📖 H-FVP指標の見方:</strong><br/>
                       • <strong>F0</strong>: スタート時の最大推進力。高いほどスタートダッシュが強い<br/>
-                      • <strong>V0</strong>: 理論上の最高速度。実際の最高速度より高い値が望ましい<br/>
+                      • <strong>V0（理論最大速度）</strong>: 加速度がゼロになる理論値。実測最高速度より20-30%高い値が正常<br/>
+                      • <strong>実測最高速度</strong>: 実際に記録した区間平均速度の最大値。一般ランナー: 6-8m/s、競技者: 9-11m/s<br/>
                       • <strong>Pmax</strong>: 最大パワー出力。F0とV0のバランスを示す<br/>
                       • <strong>DRF</strong>: 力指向性。100%に近いほど効率的に力を発揮している
                     </div>
+                    </>
+                    )}
                   </div>
                 )}
 
@@ -11928,13 +13595,25 @@ case 6: {
                     color: 'white',
                     boxShadow: '0 10px 30px rgba(16, 185, 129, 0.3)'
                   }}>
-                    <h3 style={{ 
-                      margin: '0 0 20px 0', 
-                      fontSize: '1.3rem',
-                      display: 'flex',
-                      alignItems: 'center',
-                      gap: '12px'
-                    }}>
+                    <h3 
+                      onClick={() => toggleAccordion('poseAnalysis')}
+                      style={{ 
+                        margin: '0 0 20px 0', 
+                        fontSize: '1.3rem',
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '12px',
+                        cursor: 'pointer',
+                        userSelect: 'none'
+                      }}
+                    >
+                      <span style={{ 
+                        transition: 'transform 0.3s ease',
+                        display: 'inline-block',
+                        transform: accordionState.poseAnalysis ? 'rotate(90deg)' : 'rotate(0deg)'
+                      }}>
+                        ▶
+                      </span>
                       🏃 姿勢分析
                       <span style={{ 
                         fontSize: '0.75rem', 
@@ -11946,7 +13625,9 @@ case 6: {
                       </span>
                     </h3>
 
-                    {/* 各スプリット地点での姿勢データ */}
+                    {accordionState.poseAnalysis && (
+                      <>
+                        {/* 各スプリット地点での姿勢データ */}
                     {panningPoseAnalysis.map((poseData, idx) => {
                       // 対応するスプリットのインデックスを見つける
                       const splitIndex = panningSplits.findIndex(s => s.frame === poseData.frame);
@@ -12198,6 +13879,8 @@ case 6: {
                       </div>
                     );
                   })}
+                      </>
+                    )}
                   </div>
                 )}
                 {/* パーン撮影モード: 保存ボタン */}
@@ -14779,6 +16462,137 @@ case 6: {
       )}
       {/* モバイル用の修正を適用 */}
 
+      {/* ===== Phase 4: 検定モード切り替えUI ===== */}
+      {!isMobile && (
+        <div style={{
+          position: 'fixed',
+          top: 20,
+          right: 20,
+          zIndex: 10001,
+          display: 'flex',
+          gap: 8,
+          background: 'white',
+          padding: '8px',
+          borderRadius: 12,
+          boxShadow: '0 4px 12px rgba(0,0,0,0.15)',
+          border: '2px solid #e0e0e0'
+        }}>
+          <button
+            onClick={() => setAppMode('normal')}
+            style={{
+              padding: '10px 20px',
+              fontSize: 14,
+              fontWeight: appMode === 'normal' ? 'bold' : 'normal',
+              cursor: 'pointer',
+              borderRadius: 8,
+              border: appMode === 'normal' ? '2px solid #4CAF50' : '1px solid #ccc',
+              background: appMode === 'normal' ? '#4CAF50' : 'white',
+              color: appMode === 'normal' ? 'white' : '#333',
+              transition: 'all 0.2s'
+            }}
+          >
+            📊 通常分析
+          </button>
+          {/* 検定モードボタン: 一時非表示（実装継続中） */}
+          {false && (
+          <button
+            onClick={() => setAppMode('certification')}
+            style={{
+              padding: '10px 20px',
+              fontSize: 14,
+              fontWeight: appMode === 'certification' ? 'bold' : 'normal',
+              cursor: 'pointer',
+              borderRadius: 8,
+              border: appMode === 'certification' ? '2px solid #FF9800' : '1px solid #ccc',
+              background: appMode === 'certification' ? '#FF9800' : 'white',
+              color: appMode === 'certification' ? 'white' : '#333',
+              transition: 'all 0.2s'
+            }}
+          >
+            🏃 検定モード
+          </button>
+          )}
+        </div>
+      )}
+
+      {/* ===== Phase 4: 検定モード表示 ===== */}
+      {appMode === 'certification' && (
+        <CertificationMode 
+          onBack={() => setAppMode('normal')} 
+          athleteOptions={athleteOptions}
+          currentUser={currentUser}
+          onStartMeasurement={(certInfo) => {
+            // 検定情報を保存して分析モードへ
+            setPendingCertification(certInfo);
+            setAppMode('normal');
+          }}
+          pendingCertification={pendingCertification}
+          onClearPendingCertification={() => setPendingCertification(null)}
+          analysisData={
+            pendingCertification?.measurementCompleted && panningSprintAnalysis?.hfvpData
+              ? {
+                  hfvp: {
+                    f0: panningSprintAnalysis.hfvpData.F0 / (athleteInfo.weight_kg || 60),
+                    v0: panningSprintAnalysis.hfvpData.v0,
+                    pmax: panningSprintAnalysis.hfvpData.Pmax / (athleteInfo.weight_kg || 60),
+                    drf: panningSprintAnalysis.hfvpData.DRF,
+                    rf_max: panningSprintAnalysis.hfvpData.RF_max,
+                    fv_r2: panningSprintAnalysis.hfvpData.summary?.fvR2 || 0,
+                    pos_r2: panningSprintAnalysis.hfvpData.summary?.posR2 || 0,
+                  },
+                  quality: panningSprintAnalysis.hfvpData.quality
+                    ? {
+                        pose_confidence_avg: 1,
+                        pose_confidence_min: 1,
+                        frame_drop_rate: 0,
+                        measurement_points: panningSprintAnalysis.hfvpData.summary?.usedPoints || 0,
+                        fv_r2: panningSprintAnalysis.hfvpData.summary?.fvR2 || 0,
+                        pos_r2: panningSprintAnalysis.hfvpData.summary?.posR2 || 0,
+                      }
+                    : undefined,
+                }
+              : undefined
+          }
+        />
+      )}
+
+      {/* ===== 通常分析モード（既存UI） ===== */}
+      {appMode === 'normal' && (
+        <>
+      {/* 検定待ちバナー */}
+      {pendingCertification && (
+        <div style={{
+          position: 'fixed',
+          top: 80,
+          left: '50%',
+          transform: 'translateX(-50%)',
+          zIndex: 9999,
+          background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
+          color: 'white',
+          padding: '16px 24px',
+          borderRadius: '12px',
+          boxShadow: '0 4px 20px rgba(0,0,0,0.3)',
+          display: 'flex',
+          alignItems: 'center',
+          gap: 16,
+          maxWidth: '90%',
+          animation: 'slideDown 0.3s ease-out'
+        }}>
+          <div style={{ fontSize: 24 }}>🏃</div>
+          <div style={{ flex: 1 }}>
+            <div style={{ fontWeight: 'bold', fontSize: 16, marginBottom: 4 }}>
+              検定測定中
+            </div>
+            <div style={{ fontSize: 14, opacity: 0.9 }}>
+              {pendingCertification.gradeCode} - {pendingCertification.athleteName}
+            </div>
+          </div>
+          <div style={{ fontSize: 14, opacity: 0.8 }}>
+            測定完了後、自動的に検定モードに戻ります
+          </div>
+        </div>
+      )}
+      
       {/* チュートリアルモーダル */}
       {showTutorial && (
         <div style={{
@@ -15082,6 +16896,9 @@ case 6: {
         />
         <canvas ref={canvasRef} />
       </div>
+        </>
+      )}
+      {/* ===== 通常分析モード終了 ===== */}
     </div>
   );
 };

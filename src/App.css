@@ -745,16 +745,16 @@ body {
 .angle-item {
   display: flex;
   flex-direction: column;
-  gap: 4px;
-  padding: 12px;
+  gap: 2px;
+  padding: 8px 10px;
   background: var(--gray-50);
   border-radius: var(--radius);
   border: 1px solid var(--gray-200);
 }
 
-.angle-label { font-size: 0.75rem; color: var(--gray-600); font-weight: 600; }
-.angle-value { font-size: 1.5rem; font-weight: 900; color: var(--primary); }
-.angle-hint { font-size: 0.7rem; color: var(--gray-500); font-style: italic; }
+.angle-label { font-size: 0.72rem; color: var(--gray-600); font-weight: 600; }
+.angle-value { font-size: 1.1rem; font-weight: 800; color: var(--primary); }
+.angle-hint { font-size: 0.68rem; color: var(--gray-500); font-style: italic; }
 
 .results-layout { display: flex; flex-direction: column; gap: 18px; }
 
